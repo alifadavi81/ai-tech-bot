@@ -1,96 +1,64 @@
-# bot.py — aiogram 3.7 + aiohttp webhook (Render Web Service) + GitHub search (422-safe)
-
 import os
-import re
-import io
 import json
 import logging
 import html as _html
-from typing import Dict, List, Any
+from pathlib import Path
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.enums import ParseMode
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import CommandStart
+from aiogram.client.default import DefaultBotProperties
 
 import httpx
-from aiohttp import web
-from aiogram import Dispatcher, F
-from aiogram.client.bot import Bot
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    BufferedInputFile,
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+import io
 
-# ======================= Logging =======================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("ai-tech-bot")
+# ------------------ Logger ------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ======================= ENV =======================
-def _require_env_any(*names: str) -> str:
-    for n in names:
-        v = os.getenv(n)
-        if v:
-            return v
-    raise RuntimeError(f"❌ یکی از این متغیرها باید ست شود: {', '.join(names)}")
+# ------------------ ENV ------------------
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN در env تعریف نشده")
 
-BOT_TOKEN = _require_env_any("BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
-
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
-if not WEBHOOK_PATH.startswith("/"):
-    WEBHOOK_PATH = "/" + WEBHOOK_PATH
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret123")
-
-PORT = int(os.getenv("PORT", "10000"))
-DB_PATH = os.getenv("DB_PATH", "projects.json")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-
-# ======================= Aiogram Core =======================
+# ------------------ Aiogram ------------------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ======================= DB =======================
-if not os.path.exists(DB_PATH):
-    logger.warning("⚠️ فایل %s پیدا نشد؛ از دیتابیس خالی استفاده می‌کنم.", DB_PATH)
-    db: Dict[str, Any] = {"robotics": [], "iot": [], "py_libs": []}
+# ------------------ In-memory User Mode ------------------
+# user_id -> None | "py"
+USER_MODE: dict[int, str] = {}
+
+def reset_mode(uid: int):
+    if uid in USER_MODE:
+        USER_MODE.pop(uid, None)
+
+# ------------------ DB (برای رباتیک/IoT) ------------------
+DB_PATH = Path("db.json")
+if not DB_PATH.exists():
+    logger.warning("⚠️ فایل %s پیدا نشد؛ دیتابیس خالی استفاده می‌کنم.", DB_PATH)
+    db = {"robotics": [], "iot": [], "py_libs": []}
 else:
     try:
         with open(DB_PATH, "r", encoding="utf-8") as f:
-            db = json.load(f) or {"robotics": [], "iot": [], "py_libs": []}
+            db = json.load(f) or {}
     except Exception as e:
         logger.exception("failed to load DB %s: %s", DB_PATH, e)
         db = {"robotics": [], "iot": [], "py_libs": []}
 
-def safe_get_items_by_cat(cat: str):
-    return db.get(cat, [])
+# ------------------ Helpers ------------------
+EXT_RESULTS: dict[int, list[dict]] = {}
+PROJECTS_PER_PAGE = 5
 
-# ======================= GitHub helpers =======================
-def _base_headers() -> Dict[str, str]:
-    h = {
-        "User-Agent": "ai-tech-bot/1.0 (+https://github.com/)",
-        "Accept": "application/vnd.github.text-match+json",
-        "X-GitHub-Api-Version": "2022-11-28",
+def _base_headers():
+    return {
+        "User-Agent": "TelegramBot/1.0",
+        "Accept": "application/vnd.github.v3+json",
     }
-    if GITHUB_TOKEN:
-        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    return h
-
-async def _http_get_json(url: str, params: Dict[str, str] | None = None) -> Dict[str, Any]:
-    try:
-        async with httpx.AsyncClient(timeout=25, headers=_base_headers()) as c:
-            r = await c.get(url, params=params)
-            if r.status_code >= 400:
-                logger.error("GitHub API error %s: %s | q=%s", r.status_code, r.text[:400], (params or {}).get("q", ""))
-                raise RuntimeError(f"GitHub request failed (status {r.status_code}).")
-            return r.json()
-    except Exception as e:
-        logger.exception("Github JSON fetch failed: %s", e)
-        raise RuntimeError("GitHub request failed.")
 
 async def fetch_text(url: str, timeout: int = 25) -> str:
     try:
@@ -101,6 +69,20 @@ async def fetch_text(url: str, timeout: int = 25) -> str:
             return r.text
     except Exception as e:
         logger.exception("fetch_text error: %s", e)
+        raise
+
+async def _http_get_json(url: str, params: dict | None = None) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=25, headers=_base_headers()) as c:
+            r = await c.get(url, params=params)
+            if r.status_code == 403 and "rate limit" in (r.text or "").lower():
+                ra = r.headers.get("Retry-After")
+                raise RuntimeError(f"GitHub rate limit exceeded. Retry after {ra or '?'}s")
+            if r.status_code >= 400:
+                raise RuntimeError(f"GitHub request failed (status {r.status_code}).")
+            return r.json()
+    except Exception as e:
+        logger.exception("Github JSON fetch failed: %s", e)
         raise
 
 def _to_raw_url(repo_html_url: str, path: str, default_branch: str | None = None) -> str:
@@ -114,14 +96,59 @@ def _to_raw_url(repo_html_url: str, path: str, default_branch: str | None = None
     repo_part = repo_html_url.rstrip("/").replace("https://github.com/", "")
     return f"https://raw.githubusercontent.com/{repo_part}/HEAD/{path.lstrip('/')}"
 
-async def github_code_search(q: str, per_page=5) -> List[Dict[str, str]]:
-    # ساده و سازگار با پارسر، بدون پرانتزهای پیچیده
+async def safe_edit(msg: types.Message, text: str, reply_markup=None):
+    try:
+        await msg.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        await msg.answer(text, reply_markup=reply_markup)
+
+def safe_get_items_by_cat(cat: str):
+    return db.get(cat, [])
+
+def code_menu(cat: str, proj_id: str, proj: dict):
+    kb = InlineKeyboardBuilder()
+    if proj.get("codes"):
+        for c in proj["codes"]:
+            kb.button(
+                text=f"📄 {c.get('filename','code')}",
+                callback_data=f"code_{cat}_{proj_id}_{c.get('id')}"
+            )
+    if proj.get("zip_url"):
+        kb.button(text="📦 دریافت زیپ کامل", callback_data=f"zip_{cat}_{proj_id}")
+    kb.button(text="⬅️ برگشت", callback_data=f"back_{cat}")
+    kb.button(text="🏠 خانه", callback_data="home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def build_project_keyboard(cat: str, page: int = 0):
+    kb = InlineKeyboardBuilder()
+    items = safe_get_items_by_cat(cat)
+    total = len(items)
+    start = page * PROJECTS_PER_PAGE
+    end = start + PROJECTS_PER_PAGE
+    for proj in items[start:end]:
+        kb.button(text=f"📌 {proj.get('title','پروژه')}", callback_data=f"proj_{cat}_{proj.get('id')}")
+    # paging
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(("⏮️ قبلی", f"proj_page_{cat}_{page-1}"))
+    if end < total:
+        nav_buttons.append(("⏭️ بعدی", f"proj_page_{cat}_{page+1}"))
+    for text, cb in nav_buttons:
+        kb.button(text=text, callback_data=cb)
+    kb.button(text="🏠 خانه", callback_data="home")
+    kb.button(text="⬅️ برگشت", callback_data=f"back_{cat}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+# ------------------ GitHub Search ------------------
+async def github_code_search(q: str, per_page=5):
     url = "https://api.github.com/search/code"
-    params = {"q": q.strip() or "arduino", "per_page": str(max(1, min(int(per_page or 5), 10)))}
+    params = {"q": q, "per_page": str(per_page)}
     data = await _http_get_json(url, params)
-    results: List[Dict[str, str]] = []
+    results = []
     for item in data.get("items", []):
-        repo = item.get("repository", {}) or {}
+        repo = item.get("repository", {})
         html_repo = repo.get("html_url", "")
         default_branch = repo.get("default_branch")
         path = item.get("path")
@@ -135,73 +162,91 @@ async def github_code_search(q: str, per_page=5) -> List[Dict[str, str]]:
         })
     return results
 
-# ======================= UI Helpers =======================
-EXT_RESULTS: dict[int, list[dict]] = {}
-PROJECTS_PER_PAGE = 5
-
-async def safe_edit(msg: Message, text: str, reply_markup=None):
-    try:
-        await msg.edit_text(text, reply_markup=reply_markup)
-    except Exception:
-        await msg.answer(text, reply_markup=reply_markup)
-
-def build_project_keyboard(cat: str, page: int = 0):
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    kb = InlineKeyboardBuilder()
-    items = safe_get_items_by_cat(cat)
-    total = len(items)
-    start = page * PROJECTS_PER_PAGE
-    end = start + PROJECTS_PER_PAGE
-    for proj in items[start:end]:
-        kb.button(text=f"📌 {proj.get('title','پروژه')}", callback_data=f"proj_{cat}_{proj.get('id')}")
-    if page > 0:
-        kb.button(text="⏮️ قبلی", callback_data=f"proj_page_{cat}_{page-1}")
-    if end < total:
-        kb.button(text="⏭️ بعدی", callback_data=f"proj_page_{cat}_{page+1}")
-    kb.button(text="🏠 خانه", callback_data="home")
-    kb.button(text="⬅️ برگشت", callback_data=f"back_{cat}")
-    kb.adjust(2)
-    return kb.as_markup()
-
-def code_menu(cat: str, proj_id: str, proj: dict):
-    kb = InlineKeyboardBuilder()
-    if proj.get("codes"):
-        for c in proj["codes"]:
-            kb.button(text=f"📄 {c.get('filename','code')}", callback_data=f"code_{cat}_{proj_id}_{c.get('id')}")
-    if proj.get("zip_url"):
-        kb.button(text="📦 دریافت زیپ کامل", callback_data=f"zip_{cat}_{proj_id}")
-    kb.button(text="⬅️ برگشت", callback_data=f"back_{cat}")
-    kb.button(text="🏠 خانه", callback_data="home")
-    kb.adjust(1)
-    return kb.as_markup()
-
-# ======================= Handlers =======================
+# ------------------ Handlers: Start & Menu ------------------
 @dp.message(CommandStart())
 async def start(msg: Message):
+    reset_mode(msg.from_user.id)
     kb = InlineKeyboardBuilder()
     kb.button(text="🤖 رباتیک", callback_data="cat_robotics")
     kb.button(text="🌐 اینترنت اشیا", callback_data="cat_iot")
-    kb.button(text="📚 کتابخانه‌های پایتون", callback_data="cat_py_libs")
+    kb.button(text="🐍 پایتون (جستجو)", callback_data="py_home")   # 🔁 مدل جدید پایتون
     kb.button(text="🔍 جستجو GitHub", callback_data="search")
     kb.adjust(2)
-    await msg.answer("👋 <b>سلام! خوش اومدی</b>\n\n📂 یکی از گزینه‌های زیر رو انتخاب کن:", reply_markup=kb.as_markup())
+    await msg.answer(
+        "👋 <b>سلام! خوش اومدی</b>\n\n"
+        "📂 یکی از گزینه‌های زیر رو انتخاب کن:",
+        reply_markup=kb.as_markup()
+    )
 
 @dp.callback_query(F.data == "home")
 async def go_home(cb: CallbackQuery):
+    reset_mode(cb.from_user.id)
     await start(cb.message)
     await cb.answer()
 
+# ------------------ Python: New Model ------------------
+@dp.callback_query(F.data == "py_home")
+async def py_home(cb: CallbackQuery):
+    USER_MODE[cb.from_user.id] = "py"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🚪 خروج از حالت پایتون", callback_data="py_exit")
+    kb.button(text="🏠 خانه", callback_data="home")
+    kb.adjust(1)
+    await safe_edit(
+        cb.message,
+        "🐍 <b>جستجوی پایتون</b>\n"
+        "نام کتابخانه یا موضوع رو بفرست (مثال: <code>requests</code> یا <code>تلگرام bot</code>).",
+        reply_markup=kb.as_markup()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "py_exit")
+async def py_exit(cb: CallbackQuery):
+    reset_mode(cb.from_user.id)
+    await safe_edit(cb.message, "✅ از حالت پایتون خارج شدی. از منوی اصلی انتخاب کن.")
+    await cb.answer()
+
+# ------------------ Global GitHub quick search button ------------------
 @dp.callback_query(F.data == "search")
 async def do_search(cb: CallbackQuery):
+    reset_mode(cb.from_user.id)  # حالت خاص رو پاک می‌کنیم
     await cb.answer()
     await cb.message.answer("🔍 چی میخوای جستجو کنم؟ (یه کلمه کلیدی بفرست)")
 
+# ------------------ Messages: route by mode ------------------
 @dp.message()
 async def handle_query(msg: Message):
     q = (msg.text or "").strip()
     if not q:
-        await msg.answer("یک عبارت برای جستجو بفرست.")
         return
+    mode = USER_MODE.get(msg.from_user.id)
+
+    if mode == "py":
+        # مدل جدید: جستجوی امن و ساده مخصوص پایتون
+        await msg.answer("⏳ در حال جستجوی پایتون (GitHub code)...")
+        try:
+            # کوئری ساده و قابل‌اتکا؛ از پرانتزهای پیچیده خودداری می‌کنیم
+            query = f'{q} language:python in:file'
+            results = await github_code_search(query, per_page=5)
+            if not results:
+                # تلاش دوم: تمرکز روی README و examples بدون پرانتز
+                query2 = f'{q} language:python filename:README in:file'
+                results = await github_code_search(query2, per_page=5)
+            if not results:
+                await msg.answer("❌ چیزی پیدا نشد. یک کلیدواژه‌ی ساده‌تر امتحان کن (مثال: نام لایبرری).")
+                return
+
+            EXT_RESULTS[msg.from_user.id] = results
+            kb = InlineKeyboardBuilder()
+            for i, r in enumerate(results):
+                kb.button(text=f"{r['name']} 📂 {r['repo']}", callback_data=f"ext_open_{i}")
+            kb.adjust(1)
+            await msg.answer("📌 <b>نتایج پایتون:</b>", reply_markup=kb.as_markup())
+        except Exception as e:
+            await msg.answer(f"⚠️ خطا در جستجوی پایتون: {e}")
+        return
+
+    # حالت عادی: جستجوی عمومی GitHub
     await msg.answer("⏳ در حال جستجو روی GitHub...")
     try:
         results = await github_code_search(q, per_page=5)
@@ -217,6 +262,7 @@ async def handle_query(msg: Message):
     except Exception as e:
         await msg.answer(f"⚠️ خطا: {e}")
 
+# ------------------ Open external code result ------------------
 @dp.callback_query(F.data.startswith("ext_open_"))
 async def ext_open(cb: CallbackQuery):
     try:
@@ -240,16 +286,19 @@ async def ext_open(cb: CallbackQuery):
     if len(caption) + len(safe) < 3500:
         await safe_edit(cb.message, f"<pre><code>{safe}</code></pre>\n\n{caption}")
     else:
-        doc = BufferedInputFile(code.encode("utf-8"), filename=item.get("name") or "snippet.txt")
+        doc = BufferedInputFile(code.encode("utf-8"), filename="snippet.py")
         await cb.message.answer_document(doc, caption=caption)
     await cb.answer()
 
+# ------------------ Categories (robotics / iot) ------------------
 @dp.callback_query(F.data.startswith("cat_"))
 async def show_category(cb: CallbackQuery):
+    reset_mode(cb.from_user.id)
     cat = cb.data.split("_", 1)[1]
     items = safe_get_items_by_cat(cat)
     if not items:
-        await cb.answer("⚠️ خالیه!", show_alert=True); return
+        await cb.answer("⚠️ خالیه!", show_alert=True)
+        return
     kb = build_project_keyboard(cat, page=0)
     await safe_edit(cb.message, f"📂 <b>دسته: {cat}</b>", reply_markup=kb)
     await cb.answer()
@@ -280,62 +329,86 @@ async def project_detail(cb: CallbackQuery):
         items = safe_get_items_by_cat(cat)
         proj = next((p for p in items if str(p.get("id")) == proj_id), None)
         if not proj:
-            await cb.answer("❌ پروژه پیدا نشد.", show_alert=True); return
+            await cb.answer("❌ پروژه پیدا نشد.", show_alert=True)
+            return
+
         title = proj.get("title", "(بدون عنوان)")
         desc = proj.get("description", "")
         boards = ", ".join(proj.get("boards", []) or [])
         parts = ", ".join(proj.get("parts", []) or [])
+
         txt = f"📌 <b>{_html.escape(title)}</b>\n\n"
-        if desc:   txt += f"📝 {_html.escape(desc)}\n\n"
-        if boards: txt += f"⚙️ بردها: {boards}\n"
-        if parts:  txt += f"🛒 قطعات: {parts}\n"
+        if desc:
+            txt += f"📝 {_html.escape(desc)}\n\n"
+        if boards:
+            txt += f"⚙️ بردها: {boards}\n"
+        if parts:
+            txt += f"🛒 قطعات: {parts}\n"
+
         await safe_edit(cb.message, txt, reply_markup=code_menu(cat, proj_id, proj))
         await cb.answer()
     except Exception as e:
         logger.exception("project_detail failed: %s", e)
         await cb.answer("⚠️ خطا در باز کردن پروژه.", show_alert=True)
 
-# ======================= Webhook lifecycle =======================
-async def on_startup(app: web.Application):
-    if PUBLIC_URL:
-        target = f"{PUBLIC_URL}{WEBHOOK_PATH}"
-        await bot.set_webhook(target, secret_token=WEBHOOK_SECRET)
-        logger.info("✅ Webhook set: %s", target)
-    else:
-        logger.warning("⚠️ PUBLIC_URL تعریف نشده؛ وبهوک ست نشد.")
-
-async def on_shutdown(app: web.Application):
+@dp.callback_query(F.data.startswith("code_"))
+async def send_code(cb: CallbackQuery):
     try:
-        await bot.delete_webhook()
-        logger.info("🧹 Webhook deleted")
+        _, cat, proj_id, code_id = cb.data.split("_", 3)
+        items = safe_get_items_by_cat(cat)
+        proj = next((p for p in items if str(p.get("id")) == proj_id), None)
+        if not proj:
+            await cb.answer("❌ پروژه پیدا نشد.", show_alert=True)
+            return
+        code = next((c for c in proj.get("codes", []) if str(c.get("id")) == code_id), None)
+        if not code:
+            await cb.answer("❌ کد یافت نشد.", show_alert=True)
+            return
+        raw_url = code.get("raw_url")
+        if not raw_url:
+            await cb.answer("⚠️ آدرس کد موجود نیست.", show_alert=True)
+            return
+        content = await fetch_text(raw_url)
+        safe = _html.escape(content)
+        if len(safe) < 3500:
+            await cb.message.answer(f"📄 <b>{code.get('filename','code')}</b>\n\n<pre><code>{safe}</code></pre>")
+        else:
+            doc = BufferedInputFile(content.encode("utf-8"), filename=code.get("filename", "code.py"))
+            await cb.message.answer_document(doc)
+        await cb.answer()
     except Exception as e:
-        logger.warning("Webhook delete failed: %s", e)
+        logger.exception("send_code failed: %s", e)
+        await cb.answer("⚠️ خطا در دریافت کد.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("zip_"))
+async def send_zip(cb: CallbackQuery):
     try:
-        await bot.session.close()
-        logger.info("🧹 Bot session closed")
+        _, cat, proj_id = cb.data.split("_", 2)
+        items = safe_get_items_by_cat(cat)
+        proj = next((p for p in items if str(p.get("id")) == proj_id), None)
+        if not proj:
+            await cb.answer("❌ پروژه پیدا نشد.", show_alert=True)
+            return
+        url = proj.get("zip_url")
+        if not url:
+            await cb.answer("⚠️ لینک زیپ موجود نیست.", show_alert=True)
+            return
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url)
+            if r.status_code >= 400:
+                await cb.answer("❌ دانلود زیپ ناموفق.", show_alert=True)
+                return
+            buf = io.BytesIO(r.content)
+            await cb.message.answer_document(BufferedInputFile(buf.read(), filename="project.zip"), caption="✅ پروژه آماده‌ست 📦")
+        await cb.answer()
     except Exception as e:
-        logger.warning("Bot session close failed: %s", e)
+        logger.exception("send_zip failed: %s", e)
+        await cb.answer("⚠️ خطا در ارسال زیپ.", show_alert=True)
 
-def build_app():
-    app = web.Application()
+# ------------------ Main ------------------
+async def main():
+    await dp.start_polling(bot)
 
-    async def root_get(_request: web.Request):
-        return web.Response(text="OK")
-
-    app.router.add_get("/", root_get)
-
-    SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-        secret_token=WEBHOOK_SECRET,
-    ).register(app, path=WEBHOOK_PATH)
-
-    setup_application(app, dp, bot=bot)
-
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    return app
-
-# ======================= Run =======================
 if __name__ == "__main__":
-    web.run_app(build_app(), host="0.0.0.0", port=PORT)
+    import asyncio
+    asyncio.run(main())
