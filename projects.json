@@ -1,0 +1,388 @@
+{
+  "robotics": [
+    {
+      "id": "rb_line_follower",
+      "title": "Line Follower (ساده)",
+      "boards": ["Arduino UNO", "ESP32"],
+      "parts": ["2x IR Sensor", "L298N Driver", "2x DC Motor", "Power Pack"],
+      "description": "ربات دنبال‌کننده خط با دو سنسور مادون قرمز و کنترل سرعت ساده.",
+      "code": {
+        "c": "// Arduino UNO - C\nint L1=2,R1=3, ENA=5, ENB=6, IN1=7, IN2=8, IN3=9, IN4=10;\nvoid motor(int l,int r){analogWrite(ENA,abs(l));analogWrite(ENB,abs(r));digitalWrite(IN1,l>0);digitalWrite(IN2,l<=0);digitalWrite(IN3,r>0);digitalWrite(IN4,r<=0);} \nvoid setup(){pinMode(L1,INPUT);pinMode(R1,INPUT);int p[]={ENA,ENB,IN1,IN2,IN3,IN4};for(int i: p) pinMode(i,OUTPUT);} \nvoid loop(){int L=!digitalRead(L1), R=!digitalRead(R1); if(L&&R) motor(140,140); else if(L) motor(80,160); else if(R) motor(160,80); else motor(0,0);} ",
+        "cpp": "// ESP32 - C++\n#include <Arduino.h>\nconst int L=34,R=35, ENA=25, ENB=26, IN1=27, IN2=14, IN3=12, IN4=13;\nvoid motor(int l,int r){ledcWrite(0,abs(l));ledcWrite(1,abs(r));digitalWrite(IN1,l>0);digitalWrite(IN2,l<=0);digitalWrite(IN3,r>0);digitalWrite(IN4,r<=0);} \nvoid setup(){pinMode(L,INPUT);pinMode(R,INPUT);pinMode(IN1,OUTPUT);pinMode(IN2,OUTPUT);pinMode(IN3,OUTPUT);pinMode(IN4,OUTPUT);\n ledcSetup(0, 20000, 8); ledcAttachPin(ENA,0); ledcSetup(1,20000,8); ledcAttachPin(ENB,1);} \nvoid loop(){int l=!digitalRead(L), r=!digitalRead(R); if(l&&r) motor(160,160); else if(l) motor(90,170); else if(r) motor(170,90); else motor(0,0);} ",
+        "micropython": "# ESP32 - MicroPython\nfrom machine import Pin,PWM\nL=Pin(34,Pin.IN); R=Pin(35,Pin.IN)\nENA=PWM(Pin(25),freq=20000); ENB=PWM(Pin(26),freq=20000)\nIN1,IN2,IN3,IN4=[Pin(p,Pin.OUT) for p in (27,14,12,13)]\n\ndef motor(l,r):\n    ENA.duty(abs(l)); ENB.duty(abs(r))\n    IN1.value(l>0); IN2.value(l<=0); IN3.value(r>0); IN4.value(r<=0)\n\nwhile True:\n    l=not L.value(); r=not R.value()\n    if l and r: motor(600,600)\n    elif l: motor(350,700)\n    elif r: motor(700,350)\n    else: motor(0,0)\n"
+      }
+    },
+    {
+      "id": "rb_obstacle_avoid",
+      "title": "Obstacle Avoidance Robot",
+      "boards": ["Arduino UNO", "ESP32"],
+      "parts": ["HC-SR04", "Servo (SG90)", "L298N", "2x DC Motor"],
+      "description": "ربات جلوگیری از مانع با اسکن سروو.",
+      "code": {
+        "c": "// UNO - C\n#include <Servo.h>\nServo sv; const int trig=4, echo=5; int ENA=6, ENB=9, IN1=7, IN2=8, IN3=10, IN4=11;\nlong dist(){digitalWrite(trig,0); delayMicroseconds(2); digitalWrite(trig,1); delayMicroseconds(10); digitalWrite(trig,0);\n return pulseIn(echo,1,30000)/58;}\nvoid motor(int l,int r){analogWrite(ENA,abs(l));analogWrite(ENB,abs(r));digitalWrite(IN1,l>0);digitalWrite(IN2,l<=0);digitalWrite(IN3,r>0);digitalWrite(IN4,r<=0);} \nvoid setup(){sv.attach(3); pinMode(trig,OUTPUT); pinMode(echo,INPUT); int p[]={ENA,ENB,IN1,IN2,IN3,IN4}; for(int i: p) pinMode(i,OUTPUT);} \nvoid loop(){long d=dist(); if(d>25) motor(160,160); else {motor(-140,-140); delay(300); sv.write(30); delay(200); long dl=dist(); sv.write(150); delay(200); long dr=dist(); sv.write(90); if(dl>dr) motor(160,-160); else motor(-160,160); delay(400);} }",
+        "cpp": "// ESP32 - C++ (no servo)\n#include <Arduino.h>\nconst int trig=4, echo=5, ENA=25, ENB=26, IN1=27, IN2=14, IN3=12, IN4=13;\nlong dist(){digitalWrite(trig,0); delayMicroseconds(2); digitalWrite(trig,1); delayMicroseconds(10); digitalWrite(trig,0);\n return pulseIn(echo,1,30000)/58;}\nvoid motor(int l,int r){ledcWrite(0,abs(l));ledcWrite(1,abs(r));digitalWrite(IN1,l>0);digitalWrite(IN2,l<=0);digitalWrite(IN3,r>0);digitalWrite(IN4,r<=0);} \nvoid setup(){pinMode(trig,OUTPUT); pinMode(echo,INPUT); pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);\n ledcSetup(0, 20000, 8); ledcAttachPin(ENA,0); ledcSetup(1,20000,8); ledcAttachPin(ENB,1);} \nvoid loop(){long d=dist(); if(d>25) motor(180,180); else {motor(-150,-150); delay(300); motor(180,-180); delay(400);} }",
+        "micropython": "# ESP32 - MicroPython HC-SR04\nfrom machine import Pin, PWM, time_pulse_us\nimport time\ntrig=Pin(4,Pin.OUT); echo=Pin(5,Pin.IN)\nENA=PWM(Pin(25),freq=20000); ENB=PWM(Pin(26),freq=20000)\nIN1,IN2,IN3,IN4=[Pin(p,Pin.OUT) for p in(27,14,12,13)]\n\ndef dist():\n    trig.value(0); time.sleep_us(2); trig.value(1); time.sleep_us(10); trig.value(0)\n    t=time_pulse_us(echo,1,30000)\n    return t/58 if t>0 else 999\n\ndef motor(l,r):\n    ENA.duty(abs(l)); ENB.duty(abs(r)); IN1.value(l>0); IN2.value(l<=0); IN3.value(r>0); IN4.value(r<=0)\n\nwhile True:\n    d=dist()\n    if d>25: motor(700,700)\n    else:\n        motor(0,0); time.sleep_ms(100); motor(-600,-600); time.sleep_ms(300); motor(700,-700); time.sleep_ms(400)\n"
+      }
+    },
+    {
+      "id": "rb_arm_2servo_pick",
+      "title": "بازوی 2 سروو (Pick & Place)",
+      "boards": ["Arduino UNO"],
+      "parts": ["2x SG90 Servo", "Push Button"],
+      "description": "کنترل ساده بازو برای برداشتن و گذاشتن جسم با دکمه.",
+      "code": {
+        "c": "#include <Servo.h>\nServo s1,s2; const int BTN=2;\nvoid setup(){s1.attach(9); s2.attach(10); pinMode(BTN,INPUT_PULLUP);}\nvoid loop(){ if(!digitalRead(BTN)){ s1.write(30); s2.write(120); delay(700); s1.write(90); s2.write(60); delay(700);} }\n",
+        "cpp": "// C++ مشابه C برای UNO\n#include <Arduino.h>\n#include <Servo.h>\nServo s1,s2; const int BTN=2;\nvoid setup(){s1.attach(9); s2.attach(10); pinMode(BTN,INPUT_PULLUP);} \nvoid loop(){ if(!digitalRead(BTN)){ s1.write(30); s2.write(120); delay(700); s1.write(90); s2.write(60); delay(700);} }\n",
+        "micropython": "# MicroPython - Servo با PWM 50Hz\nfrom machine import Pin, PWM\nimport time\ns1=PWM(Pin(15),freq=50); s2=PWM(Pin(2),freq=50)\nBTN=Pin(0,Pin.IN,Pin.PULL_UP)\n\ndef write_servo(pwm,deg):\n    duty=int(40+deg*(115-40)/180)\n    pwm.duty(duty)\n\nwhile True:\n    if BTN.value()==0:\n        write_servo(s1,30); write_servo(s2,120); time.sleep_ms(700)\n        write_servo(s1,90); write_servo(s2,60); time.sleep_ms(700)\n"
+      }
+    },
+    {
+      "id": "rb_encoders_pid",
+      "title": "کنترل سرعت با انکدر و PID",
+      "boards": ["Arduino UNO"],
+      "parts": ["2x Encoder Motor", "L298N", "2x IR Encoder"],
+      "description": "کنترل سرعت چرخ‌ها با PID ساده.",
+      "code": {
+        "c": "// PID بسیار ساده\nvolatile long c1=0; void isr1(){c1++;}\nint ENA=5,IN1=7,IN2=8; int target=200; float e=0, i=0;\nvoid motor(int p){analogWrite(ENA,constrain(abs(p),0,255)); digitalWrite(IN1,p>0); digitalWrite(IN2,p<=0);} \nvoid setup(){attachInterrupt(digitalPinToInterrupt(2),isr1,RISING); pinMode(ENA,OUTPUT);pinMode(IN1,OUTPUT);pinMode(IN2,OUTPUT);} \nvoid loop(){long s=c1; c1=0; delay(100); int rpm=s*10; e=target-rpm; i+=e*0.1; int u= (int)(1.0*e + 0.2*i); motor(u);} ",
+        "cpp": "// C++ – همان منطق با سینتکس C++\n#include <Arduino.h>\nvolatile long c1=0; void isr1(){c1++;}\nint ENA=5,IN1=7,IN2=8; int target=200; float e=0,i=0;\nvoid motor(int p){analogWrite(ENA,constrain(abs(p),0,255)); digitalWrite(IN1,p>0); digitalWrite(IN2,p<=0);} \nvoid setup(){attachInterrupt(digitalPinToInterrupt(2),isr1,RISING); pinMode(ENA,OUTPUT);pinMode(IN1,OUTPUT);pinMode(IN2,OUTPUT);} \nvoid loop(){long s=c1; c1=0; delay(100); int rpm=s*10; e=target-rpm; i+=e*0.1; int u=(int)(1.0*e+0.2*i); motor(u);} ",
+        "micropython": "# MicroPython - شمارش پالس\nfrom machine import Pin, PWM\nimport time\ncnt=0\ndef isr(p):\n    global cnt; cnt+=1\nirq=Pin(4,Pin.IN); irq.irq(trigger=Pin.IRQ_RISING, handler=isr)\nENA=PWM(Pin(25),freq=20000); IN1=Pin(27,Pin.OUT); IN2=Pin(14,Pin.OUT)\n\ntarget=200; e=i=0\nwhile True:\n    s=cnt; cnt=0; time.sleep_ms(100)\n    rpm=s*10; e=target-rpm; i+=e*0.1; u=int(3*e+1*i)\n    ENA.duty(abs(u)); IN1.value(u>0); IN2.value(u<=0)\n"
+      }
+    },
+    {
+      "id": "rb_bt_rc_car",
+      "title": "ماشین کنترل از راه دور بلوتوث",
+      "boards": ["Arduino UNO", "ESP32"],
+      "parts": ["HC-05/06 or ESP32 BLE", "L298N"],
+      "description": "کنترل حرکت با دستورات سریال بلوتوث.",
+      "code": {
+        "c": "// UNO - C (HC-05)\nchar c; int ENA=5,ENB=6,IN1=7,IN2=8,IN3=9,IN4=10;\nvoid motor(int l,int r){analogWrite(ENA,abs(l));analogWrite(ENB,abs(r));digitalWrite(IN1,l>0);digitalWrite(IN2,l<=0);digitalWrite(IN3,r>0);digitalWrite(IN4,r<=0);} \nvoid setup(){Serial.begin(9600);int p[]={ENA,ENB,IN1,IN2,IN3,IN4};for(int i:p) pinMode(i,OUTPUT);} \nvoid loop(){ if(Serial.available()){ c=Serial.read(); if(c=='F') motor(180,180); else if(c=='B') motor(-180,-180); else if(c=='L') motor(-150,150); else if(c=='R') motor(150,-150); else motor(0,0);} }",
+        "cpp": "// ESP32 - C++ BLE (ساده با Serial BT)\n#include <BluetoothSerial.h>\nBluetoothSerial BT; char c;\n// مشابه تعریف موتورها...\nvoid setup(){BT.begin(\"ESP32-RC\"); /* پین‌های موتور و PWM مثل قبل */}\nvoid loop(){ if(BT.available()){ c=BT.read(); /* همان منطق حرکت */ } }\n",
+        "micropython": "# MicroPython – سریال ساده (HC-05)\nfrom machine import Pin,PWM,UART\nu=UART(2,9600)\n# تعریف پین‌های موتور مثل مثال‌های قبل\nwhile True:\n    if u.any():\n        c=u.read(1)\n        # if c==b'F': ...\n"
+      }
+    },
+    {
+      "id": "rb_ir_remote",
+      "title": "کنترل ربات با ریموت IR",
+      "boards": ["Arduino UNO"],
+      "parts": ["IR Receiver (VS1838B)", "Remote"],
+      "description": "کنترل حرکتی با کدهای ریموت مادون قرمز.",
+      "code": {
+        "c": "// نیاز به کتابخانه IRremote\n#include <IRremote.h>\nIRrecv ir(2); decode_results res; \nvoid setup(){ir.enableIRIn();}\nvoid loop(){ if(ir.decode(&res)){ unsigned long k=res.value; // switch(k){...}\n ir.resume(); } }\n",
+        "cpp": "// C++ مشابه",
+        "micropython": "# MicroPython: خواندن خام مناسب نیست؛ بهتر از سنسور اختصاصی استفاده شود"
+      }
+    },
+    {
+      "id": "rb_edge_avoid",
+      "title": "Edge Avoid (سقوط‌نکردن)",
+      "boards": ["Arduino UNO"],
+      "parts": ["2x IR Reflective Bottom"],
+      "description": "تشخیص لبه میز و توقف/بازگشت.",
+      "code": {
+        "c": "int L=A0,R=A1; void setup(){pinMode(L,INPUT); pinMode(R,INPUT);} void loop(){int l=analogRead(L), r=analogRead(R); if(l<300||r<300){ /* عقب */ } else { /* جلو */ } }",
+        "cpp": "// C++ مشابه",
+        "micropython": "# MicroPython مشابه با ADC"
+      }
+    },
+    {
+      "id": "rb_servo_scan_radar",
+      "title": "اسکن راداری با سروو + آلتراسونیک",
+      "boards": ["Arduino UNO"],
+      "parts": ["HC-SR04", "Servo"],
+      "description": "اسکن محیط و چاپ مسافت‌ها.",
+      "code": {
+        "c": "#include <Servo.h>\nServo s; const int trig=4,echo=5; long dist(){/* مثل قبل */}\nvoid setup(){s.attach(3); Serial.begin(9600);} \nvoid loop(){ for(int a=20;a<=160;a+=10){ s.write(a); delay(150); Serial.println(dist()); } }",
+        "cpp": "// C++ مشابه",
+        "micropython": "# MicroPython مشابه"
+      }
+    },
+    {
+      "id": "rb_sumorobot_basic",
+      "title": "Sumo Robot (پایه)",
+      "boards": ["Arduino UNO"],
+      "parts": ["2x IR Bottom", "2x DC Motor", "L298N"],
+      "description": "حمله در حضور حریف و عدم خروج از زمین.",
+      "code": {
+        "c": "// منطق: اگر حریف نزدیک (مثلاً IR جلو 1) جلو برو، اگر لبه تشخیص شد، عقب/چرخش.\nvoid loop(){ /* pseudo */ }",
+        "cpp": "// C++ مشابه",
+        "micropython": "# MicroPython مشابه"
+      }
+    },
+    {
+      "id": "rb_joystick_car",
+      "title": "RC با جوی‌استیک",
+      "boards": ["Arduino UNO"],
+      "parts": ["XY Joystick", "L298N"],
+      "description": "کنترل سرعت/جهت با آنالوگ جوی‌استیک.",
+      "code": {
+        "c": "int X=A0,Y=A1; void loop(){int x=analogRead(X)-512, y=analogRead(Y)-512; int l=y+x/2, r=y-x/2; /* درایو موتور */ }",
+        "cpp": "// C++ مشابه",
+        "micropython": "# MicroPython مشابه"
+      }
+    }
+  ],
+  "iot": [
+    {
+      "id": "iot_esp32_mqtt_dht",
+      "title": "ESP32 + MQTT + DHT11",
+      "boards": ["ESP32"],
+      "parts": ["DHT11", "WiFi"],
+      "description": "ارسال دما/رطوبت به سرور MQTT.",
+      "code": {
+        "c": "// Arduino (ESP32) با PubSubClient\n#include <WiFi.h>\n#include <PubSubClient.h>\n// SSID/PASS و broker را ست کنید\nvoid setup(){ /* اتصال WiFi و MQTT */ }\nvoid loop(){ /* publish هر 5 ثانیه */ }\n",
+        "cpp": "// C++ همان ساختار",
+        "micropython": "# MicroPython MQTT\nimport network, time\nfrom umqtt.simple import MQTTClient\nssid='SSID'; pwd='PASS'; broker='test.mosquitto.org'\nsta=network.WLAN(network.STA_IF); sta.active(True); sta.connect(ssid,pwd)\nwhile not sta.isconnected(): time.sleep_ms(200)\ncli=MQTTClient('esp32','test.mosquitto.org')\ncli.connect(); cli.publish(b\"home/dht\", b\"{temp:25,hum:40}\")\n"
+      }
+    },
+    {
+      "id": "iot_esp32_http_post",
+      "title": "ESP32 → HTTP POST (REST)",
+      "boards": ["ESP32"],
+      "parts": ["WiFi"],
+      "description": "ارسال داده سنسور به API با HTTP POST.",
+      "code": {
+        "c": "#include <WiFi.h>\n#include <HTTPClient.h>\nvoid loop(){HTTPClient http; http.begin(\"https://example.com/api\"); http.addHeader(\"Content-Type\",\"application/json\"); http.POST(\"{\\\"t\\\":25}\"); http.end(); delay(5000);} ",
+        "cpp": "// C++ مشابه",
+        "micropython": "import urequests, time\nwhile True:\n    try:\n        r=urequests.post('https://httpbin.org/post',json={'t':25})\n        r.close()\n    except Exception as e:\n        pass\n    time.sleep(5)\n"
+      }
+    },
+    {
+      "id": "iot_esp32_webserver",
+      "title": "وب‌سرور محلی ESP32",
+      "boards": ["ESP32"],
+      "parts": ["WiFi"],
+      "description": "نمایش صفحه وب با کنترل LED.",
+      "code": {
+        "c": "#include <WiFi.h>\n#include <WebServer.h>\nWebServer srv(80);\nvoid setup(){ /* WiFi.begin; srv.on(\"/\",[](){srv.send(200,\"text/html\",\"<h1>Hi</h1>\");}); srv.begin(); */ }\nvoid loop(){srv.handleClient();}\n",
+        "cpp": "// C++ مشابه",
+        "micropython": "import socket\ns=socket.socket(); s.bind(('0.0.0.0',80)); s.listen(1)\nwhile True:\n    cl,addr=s.accept(); req=cl.recv(1024)\n    cl.send('HTTP/1.0 200 OK\\r\\nContent-Type:text/html\\r\\n\\r\\nHello')\n    cl.close()\n"
+      }
+    },
+    {
+      "id": "iot_esp8266_mqtt_relay",
+      "title": "ESP8266 MQTT Relay",
+      "boards": ["ESP8266"],
+      "parts": ["Relay Module"],
+      "description": "کنترل رله با پیام MQTT.",
+      "code": {
+        "c": "// ESP8266 با PubSubClient – مشابه ESP32",
+        "cpp": "// C++ مشابه",
+        "micropython": "# MicroPython: subscribe و کنترل GPIO"
+      }
+    },
+    {
+      "id": "iot_esp32_blynk_led",
+      "title": "ESP32 + Blynk LED",
+      "boards": ["ESP32"],
+      "parts": ["Blynk App"],
+      "description": "کنترل LED از طریق Blynk.",
+      "code": {
+        "c": "// نیازمند کتابخانه Blynk – مثال رسمی",
+        "cpp": "// C++ مشابه",
+        "micropython": "# MicroPython: از blynklib استفاده کنید (غیررسمی)"
+      }
+    },
+    {
+      "id": "iot_esp32_telegram_bot",
+      "title": "تلگرام‌بات ساده روی ESP32",
+      "boards": ["ESP32"],
+      "parts": ["WiFi", "Telegram Bot Token"],
+      "description": "دریافت پیام و روشن/خاموش LED.",
+      "code": {
+        "c": "// با UniversalTelegramBot – مثال‌های رسمی را ببینید",
+        "cpp": "// C++ مشابه",
+        "micropython": "# MicroPython: استفاده از urequests برای Bot API"
+      }
+    },
+    {
+      "id": "iot_esp32_ntp_oled",
+      "title": "NTP Clock + OLED",
+      "boards": ["ESP32"],
+      "parts": ["SSD1306 OLED"],
+      "description": "نمایش زمان NTP روی OLED.",
+      "code": {
+        "c": "// استفاده از NTPClient و Adafruit_SSD1306",
+        "cpp": "// C++ مشابه",
+        "micropython": "import ntptime, time\n# تنظیم ntp و نمایش روی OLED با ssd1306.py\n"
+      }
+    },
+    {
+      "id": "iot_esp32_dallas_mqtt",
+      "title": "DS18B20 → MQTT",
+      "boards": ["ESP32"],
+      "parts": ["DS18B20", "Resistor 4.7k"],
+      "description": "خواندن دمای DS18B20 و ارسال به MQTT.",
+      "code": {
+        "c": "// OneWire + DallasTemperature + PubSubClient",
+        "cpp": "// C++ مشابه",
+        "micropython": "import onewire, ds18x20, machine\n# اسکن و publish دما\n"
+      }
+    },
+    {
+      "id": "iot_esp32_cam_http",
+      "title": "ESP32-CAM HTTP Stream",
+      "boards": ["ESP32-CAM"],
+      "parts": ["Camera Module"],
+      "description": "استریم ویدیو HTTP روی شبکه.",
+      "code": {
+        "c": "// Arduino examples/CameraWebServer",
+        "cpp": "// C++ مشابه",
+        "micropython": "# نیازمند فریم‌ورک خاص؛ توصیه: Arduino"
+      }
+    },
+    {
+      "id": "iot_esp32_microdot",
+      "title": "MicroPython + Microdot API",
+      "boards": ["ESP32"],
+      "parts": ["WiFi"],
+      "description": "ساخت API کوچک با Microdot.",
+      "code": {
+        "c": "// برای C/C++ پیشنهاد نمی‌شود",
+        "cpp": "// ---",
+        "micropython": "from microdot import Microdot\napp=Microdot()\n@app.get('/')\ndef hi(req): return 'ok'\napp.run()\n"
+      }
+    }
+  ],
+  "py_libs": [
+    {
+      "name": "requests",
+      "category": "HTTP",
+      "description": "ارسال درخواست‌های HTTP ساده.",
+      "install": "pip install requests",
+      "example": "import requests\nr=requests.get('https://httpbin.org/get')\nprint(r.status_code, r.json())"
+    },
+    {
+      "name": "httpx",
+      "category": "HTTP (async)",
+      "description": "کلاینت async/sync مدرن.",
+      "install": "pip install httpx",
+      "example": "import httpx, asyncio\nasync def main():\n    async with httpx.AsyncClient() as c:\n        r=await c.get('https://httpbin.org/get')\n        print(r.json())\nasyncio.run(main())"
+    },
+    {
+      "name": "beautifulsoup4",
+      "category": "Scraping",
+      "description": "پارس HTML ساده.",
+      "install": "pip install beautifulsoup4",
+      "example": "from bs4 import BeautifulSoup as BS\nhtml='<h1>Hi</h1>'\nprint(BS(html,'html.parser').h1.text)"
+    },
+    {
+      "name": "selectolax",
+      "category": "Scraping (fast)",
+      "description": "HTML Parser سریع.",
+      "install": "pip install selectolax",
+      "example": "from selectolax.parser import HTMLParser\nhtml='<div class=\"x\">ok</div>'\nprint(HTMLParser(html).css_first('.x').text())"
+    },
+    {
+      "name": "pandas",
+      "category": "Data",
+      "description": "آنالیز داده‌ها.",
+      "install": "pip install pandas",
+      "example": "import pandas as pd\nprint(pd.DataFrame({'a':[1,2]}) )"
+    },
+    {
+      "name": "numpy",
+      "category": "Data/Math",
+      "description": "محاسبات عددی.",
+      "install": "pip install numpy",
+      "example": "import numpy as np\nA=np.array([[1,2],[3,4]]); print(A.T)"
+    },
+    {
+      "name": "matplotlib",
+      "category": "Plot",
+      "description": "ترسیم نمودار.",
+      "install": "pip install matplotlib",
+      "example": "import matplotlib.pyplot as plt\nplt.plot([1,2,3],[2,3,5]); plt.show()"
+    },
+    {
+      "name": "scikit-learn",
+      "category": "ML",
+      "description": "الگوریتم‌های یادگیری ماشین.",
+      "install": "pip install scikit-learn",
+      "example": "from sklearn.linear_model import LinearRegression\nimport numpy as np\nX=np.array([[1],[2],[3]]); y=[2,3,5]\nprint(LinearRegression().fit(X,y).predict([[4]]))"
+    },
+    {
+      "name": "fastapi",
+      "category": "Web",
+      "description": "وب‌فریم‌ورک سریع.",
+      "install": "pip install fastapi uvicorn",
+      "example": "from fastapi import FastAPI\napp=FastAPI()\n@app.get('/')\ndef hi(): return {'ok':True}"
+    },
+    {
+      "name": "flask",
+      "category": "Web",
+      "description": "وب‌فریم‌ورک سبک.",
+      "install": "pip install flask",
+      "example": "from flask import Flask\napp=Flask(__name__)\n@app.route('/')\ndef hi(): return 'ok'"
+    },
+    {
+      "name": "sqlalchemy",
+      "category": "DB",
+      "description": "ORM پایتون.",
+      "install": "pip install sqlalchemy",
+      "example": "from sqlalchemy import create_engine\nengine=create_engine('sqlite:///app.db')"
+    },
+    {
+      "name": "psycopg2-binary",
+      "category": "DB",
+      "description": "درایور PostgreSQL.",
+      "install": "pip install psycopg2-binary",
+      "example": "import psycopg2\n# conn=psycopg2.connect(...)\n"
+    },
+    {
+      "name": "pydantic",
+      "category": "Validation",
+      "description": "مدل‌سازی/اعتبارسنجی داده.",
+      "install": "pip install pydantic",
+      "example": "from pydantic import BaseModel\nclass User(BaseModel): name:str, age:int\nprint(User(name='a',age=1))"
+    },
+    {
+      "name": "loguru",
+      "category": "Logging",
+      "description": "لاگینگ ساده و جذاب.",
+      "install": "pip install loguru",
+      "example": "from loguru import logger\nlogger.info('hello')"
+    },
+    {
+      "name": "rich",
+      "category": "CLI UI",
+      "description": "خروجی رنگی و جدول.",
+      "install": "pip install rich",
+      "example": "from rich import print\nprint('[bold green]OK[/]')"
+    },
+    {
+      "name": "typer",
+      "category": "CLI",
+      "description": "ساخت CLI مدرن.",
+      "install": "pip install typer",
+      "example": "import typer\napp=typer.Typer()\n@app.command()\ndef hi(name:str): print('hi',name)\nif __name__=='__main__': app()"
+    },
+    {
+      "name": "openpyxl",
+      "category": "Excel",
+      "description": "کار با فایل‌های اکسل.",
+      "install": "pip install openpyxl",
+      "example": "from openpyxl import Workbook\nwb=Workbook(); ws=wb.active; ws['A1']='Hi'; wb.save('a.xlsx')"
+    },
+    {
+      "name": "xlrd",
+      "category": "Excel (read)",
+      "description": "خواندن اکسل قدیمی.",
+      "install": "pip install xlrd",
+      "example": "import xlrd\n# کتابخانه قدیمی، فقط برای xls\n"
+    },
+    {
+      "name": "opencv-python",
+      "category": "CV",
+      "description": "پردازش تصویر.",
+      "install": "pip install opencv-python",
+      "example": "import cv2\nimg=cv2.imread('a.jpg'); gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)"
+    },
+    {
+      "name": "pyserial",
+      "category": "Serial",
+      "description": "ارتباط سریال با بردها.",
+      "install": "pip install pyserial",
+      "example": "import serial\nser=serial.Serial('COM3',9600)\nser.write(b'F')"
+    }
+  ]
+}

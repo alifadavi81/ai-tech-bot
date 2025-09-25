@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: ai-tech-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Fallbacks if not in .env
+      PORT: "${PORT:-10000}"
+      WEBHOOK_PATH: "${WEBHOOK_PATH:-/webhook}"
+      TZ: "${TZ:-Europe/Berlin}"
+    volumes:
+      - ./data:/app/data
+      # If you want the projects DB outside the container:
+      - ./projects.json:/app/projects.json:ro
+    ports:
+      # Map host:container (container listens on PORT)
+      - "10000:10000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:10000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
