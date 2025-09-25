@@ -11,6 +11,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
+from aiogram.client.default import DefaultBotProperties
 
 # ------------------ تنظیمات ------------------
 load_dotenv()
@@ -20,7 +21,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-tech-bot")
 
 dp = Dispatcher()
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 
 # ------------------ حافظه ساده ------------------
 USER_MODE = {}      # حالت کاربر (py یا None)
