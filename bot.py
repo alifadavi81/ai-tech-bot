@@ -6,22 +6,10 @@ import html as _html
 from pathlib import Path
 from dotenv import load_dotenv
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-import os
-import json
-import logging
-import html as _html
-from pathlib import Path
-from dotenv import load_dotenv
-
-import httpx
-from aiohttp import web
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
-from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -216,9 +204,10 @@ async def ext_open(cb: CallbackQuery):
         await cb.message.answer_document(doc, caption=caption)
     await cb.answer()
 
-# ------------------ اجرای بات ------------------
+# ------------------ اجرای بات (فقط Webhook) ------------------
 async def on_startup(app: web.Application):
     logger.info("✅ Bot started")
+
 
 def main():
     from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -227,13 +216,7 @@ def main():
     setup_application(app, dp, bot=bot)
     return app
 
+
 if __name__ == "__main__":
-    import asyncio
-
-    async def main_polling():
-        await dp.start_polling(bot, skip_updates=True)
-
-    asyncio.run(main_polling())
-
-
-# force update test
+    import uvicorn
+    uvicorn.run("bot:main", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
