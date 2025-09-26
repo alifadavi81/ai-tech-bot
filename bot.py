@@ -6,6 +6,7 @@ import json
 import re
 import unicodedata
 from pathlib import Path
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from aiohttp import web
@@ -134,8 +135,21 @@ async def fetch_text(url):
         r.raise_for_status()
         return r.text
 
-def _to_raw_url(html_repo, path, branch):
-    return f"{html_repo.replace('https://github.com', 'https://raw.githubusercontent.com')}/{branch}/{path}"
+def raw_url_from_blob(html_url: str) -> str | None:
+    # https://github.com/user/repo/blob/<ref>/path -> https://raw.githubusercontent.com/user/repo/<ref>/path
+    try:
+        if "github.com" in html_url and "/blob/" in html_url:
+            base, rest = html_url.split("github.com/", 1)
+            user_repo, blob_ref_path = rest.split("/blob/", 1)
+            ref, path = blob_ref_path.split("/", 1)
+            return f"https://raw.githubusercontent.com/{user_repo}/{ref}/{quote(path)}"
+    except Exception:
+        return None
+    return None
+
+def _to_raw_url(owner_repo: str, ref: str, path: str):
+    # ref: می‌تواند default_branch یا sha باشد. path باید URL-encode شود.
+    return f"https://raw.githubusercontent.com/{owner_repo}/{ref}/{quote(path)}"
 
 async def safe_edit(msg: Message, text: str, reply_markup=None):
     try:
@@ -151,16 +165,24 @@ async def github_code_search(q: str, per_page=5, page=1):
     results = []
     for item in data.get("items", []):
         repo = item.get("repository", {})
-        html_repo = repo.get("html_url", "")
+        full_name = repo.get("full_name", "")  # user/repo
         default_branch = repo.get("default_branch") or "main"
         path = item.get("path")
-        raw_url = _to_raw_url(html_repo, path, default_branch)
+        sha = item.get("sha")  # بهتره از sha استفاده کنیم
+        html_url = item.get("html_url")
+
+        # ابتدا با sha بساز؛ اگر نبود، با default_branch
+        ref = sha or default_branch
+        raw_url = _to_raw_url(full_name, ref, path)
+
         results.append({
             "name": item.get("name"),
             "path": path,
-            "repo": repo.get("full_name"),
-            "html_url": item.get("html_url"),
+            "repo": full_name,
+            "html_url": html_url,
             "raw_url": raw_url,
+            "sha": sha,
+            "default_branch": default_branch,
         })
     return results
 
@@ -197,14 +219,14 @@ def build_github_queries(kind: str, term: str) -> list[str]:
             f'"{base}" filename:bom.csv OR filename:parts.csv',
             f'"{base}" filename:bom.tsv OR filename:parts.tsv',
             f'"{base}" filename:bom.md OR filename:parts.md',
-            f'"{base}" \"bill of materials\" in:file',
+            f'"{base}" "bill of materials" in:file',
             f'"{base}" path:bom OR path:hardware/bom OR path:docs/bom',
         ]
     elif kind == "guide":
         queries += [
             f'"{base}" filename:README.md in:path',
             f'"{base}" path:docs in:path',
-            f'"{base}" \"hardware design\" in:file',
+            f'"{base}" "hardware design" in:file',
             f'"{base}" filename:GUIDE.md OR filename:DESIGN.md',
         ]
     else:  # code
@@ -224,7 +246,7 @@ def build_github_queries(kind: str, term: str) -> list[str]:
             uniq.append(q)
     return uniq
 
-# ------------------ جستجوی هوشمند گیت‌هاب + رتبه‌بندی + فیلتر ------------------
+# ------------------ رتبه‌بندی ------------------
 def _score_item(kind: str, name: str, path: str) -> int:
     name = (name or "").lower()
     path = (path or "").lower()
@@ -244,10 +266,8 @@ def _score_item(kind: str, name: str, path: str) -> int:
         if name.endswith((".py", ".c", ".cpp", ".ino", ".rs", ".java")): score += 3
         if "src/" in path: score += 2
         if "examples/" in path: score += 1
-    # پنالتی نتایج مزاحم
     if is_noisy_path(path):
         score -= 4
-    # حذف فایل‌های خیلی کوچک/نمونه‌های قدیمی را نمی‌توانیم بدون متادیتا تشخیص دهیم
     return score
 
 async def github_search_smart(kind: str, term: str, per_query: int = 5, max_total: int = 10):
@@ -270,9 +290,7 @@ async def github_search_smart(kind: str, term: str, per_query: int = 5, max_tota
             name = r.get("name") or ""
             path = r.get("path") or ""
 
-            # فیلتر سخت مسیرهای مزاحم
             if is_noisy_path(path):
-                # به‌جای حذف کامل می‌توانستیم پنالتی شدید بدهیم؛ ولی کاربر خواست نتایج نامربوط حذف شوند
                 continue
 
             score = _score_item(kind, name, path)
@@ -302,7 +320,7 @@ async def start(msg: Message):
     kb.button(text="🤖 رباتیک", callback_data="cat_robotics")
     kb.button(text="🌐 اینترنت اشیا", callback_data="cat_iot")
     kb.button(text="🐍 پایتون (جستجو)", callback_data="py_home")
-    kb.button(text="🔍 جستجو", callback_data="search")  # منوی جدید جستجو
+    kb.button(text="🔍 جستجو", callback_data="search")
     kb.adjust(2)
     await msg.answer(
         "👋 <b>سلام! خوش اومدی</b>\n\n"
@@ -317,7 +335,7 @@ async def go_home(cb: CallbackQuery):
     await start(cb.message)
     await cb.answer()
 
-# ------------------ منوی جستجو با ۴ گزینه ------------------
+# ------------------ منوی جستجو (۴ گزینه) ------------------
 @dp.callback_query(F.data == "search")
 async def do_search(cb: CallbackQuery):
     reset_mode(cb.from_user.id)
@@ -365,10 +383,9 @@ async def py_exit(cb: CallbackQuery):
     await safe_edit(cb.message, "✅ از حالت پایتون خارج شدی. از منوی اصلی انتخاب کن.")
     await cb.answer()
 
-# ------------------ دکمه ادامه جستجو در گیت‌هاب ------------------
+# ------------------ ادامه جستجو در گیت‌هاب ------------------
 @dp.callback_query(F.data.startswith("gh_more_"))
 async def gh_more(cb: CallbackQuery):
-    # فرمت: gh_more_{kind}::{query}
     try:
         _, payload = cb.data.split("_", 1)
         kind, term = payload.split("::", 1)
@@ -408,20 +425,19 @@ async def handle_query(msg: Message):
     if not q:
         return
 
-    # حالت پایتون (قدیم)
+    # حالت پایتون
     mode = USER_MODE.get(msg.from_user.id)
     if mode == "py":
         await msg.answer("⏳ در حال جستجوی پایتون (GitHub code)...")
         try:
-            query = f'{q} language:python in:file'
+            query = f'{q} in:python language:python in:file'  # کمی دقیق‌تر
             results = await github_code_search(query, per_page=5)
             if not results:
-                query2 = f'{q} language:python filename:README in:file'
+                query2 = f'{q} filename:README in:file language:python'
                 results = await github_code_search(query2, per_page=5)
             if not results:
                 await msg.answer("❌ چیزی پیدا نشد. یک کلیدواژه‌ی ساده‌تر امتحان کن.")
                 return
-
             EXT_RESULTS[msg.from_user.id] = results
             kb = InlineKeyboardBuilder()
             for i, r in enumerate(results):
@@ -506,19 +522,30 @@ async def ext_open(cb: CallbackQuery):
         await cb.answer("⏰ منقضی شده", show_alert=True)
         return
     item = items[idx]
-    try:
-        code = await fetch_text(item["raw_url"])
-    except Exception:
-        await cb.message.answer("❌ دانلود کد ناموفق بود.")
-        await cb.answer()
-        return
-    caption = f"🔗 <a href='{item['html_url']}'>مشاهده در GitHub</a>\n⚠️ لایسنس رو چک کن."
-    safe = _html.escape(code)
-    if len(caption) + len(safe) < MAX_TEXT_LEN:
-        await safe_edit(cb.message, f"<pre><code>{safe}</code></pre>\n\n{caption}")
-    else:
-        doc = BufferedInputFile(code.encode("utf-8"), filename="snippet.py")
-        await cb.message.answer_document(doc, caption=caption)
+
+    # تلاش اول: raw با ref (sha یا برنچ)
+    raw_url = item.get("raw_url")
+    # بازگشتی: اگر 404 شد از blob بساز
+    fallback_raw = raw_url_from_blob(item.get("html_url") or "") or raw_url
+
+    for try_url in [raw_url, fallback_raw]:
+        if not try_url:
+            continue
+        try:
+            code = await fetch_text(try_url)
+            caption = f"🔗 <a href='{item['html_url']}'>مشاهده در GitHub</a>\n⚠️ لایسنس رو چک کن."
+            safe = _html.escape(code)
+            if len(caption) + len(safe) < MAX_TEXT_LEN:
+                await safe_edit(cb.message, f"<pre><code>{safe}</code></pre>\n\n{caption}")
+            else:
+                doc = BufferedInputFile(code.encode("utf-8"), filename="snippet.py")
+                await cb.message.answer_document(doc, caption=caption)
+            await cb.answer()
+            return
+        except Exception:
+            continue
+
+    await cb.message.answer("❌ دانلود کد ناموفق بود (raw 404).")
     await cb.answer()
 
 # ------------------ وب‌هوک با aiohttp ------------------
