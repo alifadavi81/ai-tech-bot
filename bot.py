@@ -17,6 +17,10 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # مثلا: https://your-service.onrender.com/webhook
 PORT = int(os.getenv("PORT", "10000"))
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # اختیاری، برای کاهش Rate Limit
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN در env تنظیم نشده است.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-tech-bot")
@@ -25,14 +29,20 @@ dp = Dispatcher()
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 # ------------------ حافظه ساده ------------------
-USER_MODE = {}      # حالت کاربر (py یا None)
-EXT_RESULTS = {}    # نتایج آخرین جستجو
-MAX_TEXT_LEN = 4000 # محدودیت تلگرام
+USER_MODE = {}       # حالت کاربر (py یا None)
+EXT_RESULTS = {}     # نتایج آخرین جستجو
+MAX_TEXT_LEN = 4000  # محدودیت نمایش تلگرام
 
 def reset_mode(uid: int):
     USER_MODE[uid] = None
 
 # ------------------ ابزارهای کمکی ------------------
+def _gh_headers():
+    h = {"Accept": "application/vnd.github+json", "User-Agent": "ai-tech-bot/1.0"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
+
 async def _http_get_json(url, params=None, headers=None):
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(url, params=params, headers=headers)
@@ -40,7 +50,7 @@ async def _http_get_json(url, params=None, headers=None):
         return r.json()
 
 async def fetch_text(url):
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "ai-tech-bot/1.0"}) as client:
         r = await client.get(url)
         r.raise_for_status()
         return r.text
@@ -55,10 +65,10 @@ async def safe_edit(msg: Message, text: str, reply_markup=None):
         await msg.answer(text, reply_markup=reply_markup, disable_web_page_preview=True)
 
 # ------------------ GitHub Search ------------------
-async def github_code_search(q: str, per_page=5):
+async def github_code_search(q: str, per_page=5, page=1):
     url = "https://api.github.com/search/code"
-    params = {"q": q, "per_page": str(per_page)}
-    data = await _http_get_json(url, params)
+    params = {"q": q, "per_page": str(per_page), "page": str(page)}
+    data = await _http_get_json(url, params, headers=_gh_headers())
     results = []
     for item in data.get("items", []):
         repo = item.get("repository", {})
@@ -150,9 +160,15 @@ async def handle_query(msg: Message):
             kb = InlineKeyboardBuilder()
             for i, r in enumerate(results):
                 kb.button(text=f"{r['name']} 📂 {r['repo']}", callback_data=f"ext_open_{i}")
-            kb.button(text="🔄 جستجوی بیشتر", callback_data="py_more")
+            # اگر صفحه‌بندی خواستی بعداً می‌تونی ext_more_2 و ... بسازی
+            kb.button(text="ℹ️ جستجوی بیشتر؟ دوباره عبارت بفرست", callback_data="py_more_info")
             kb.adjust(1)
             await msg.answer("📌 <b>نتایج پایتون:</b>", reply_markup=kb.as_markup())
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                await msg.answer("⚠️ GitHub rate limit. اگر شد در env یک GITHUB_TOKEN ست کن.")
+            else:
+                await msg.answer(f"⚠️ خطای GitHub: {e}")
         except Exception as e:
             await msg.answer(f"⚠️ خطا در جستجوی پایتون: {e}")
         return
@@ -170,6 +186,11 @@ async def handle_query(msg: Message):
             kb.button(text=f"{r['name']} 📂 {r['repo']}", callback_data=f"ext_open_{i}")
         kb.adjust(1)
         await msg.answer("📌 <b>نتایج جستجو:</b>", reply_markup=kb.as_markup())
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            await msg.answer("⚠️ GitHub rate limit. اگر شد در env یک GITHUB_TOKEN ست کن.")
+        else:
+            await msg.answer(f"⚠️ خطای GitHub: {e}")
     except Exception as e:
         await msg.answer(f"⚠️ خطا: {e}")
 
@@ -201,22 +222,30 @@ async def ext_open(cb: CallbackQuery):
         await cb.message.answer_document(doc, caption=caption)
     await cb.answer()
 
+# دکمه راهنمای «جستجوی بیشتر»
+@dp.callback_query(F.data == "py_more_info")
+async def py_more_info(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("🔎 برای نتایج بیشتر، عبارت جدید یا دقیق‌تر بفرست (مثلاً: <code>fastapi language:python in:file</code>).")
+
 # ------------------ Webhook با aiohttp ------------------
 async def on_startup(app: web.Application):
-    # ست‌کردن وب‌هوک (یکبار)
-    if not WEBHOOK_URL:
-        # اگر تنظیم نکردی، از URL رندر + /webhook استفاده کن
-        # مثلا https://your-service.onrender.com/webhook
-        logger.warning("WEBHOOK_URL تعریف نشده. لطفاً در env ست کن.")
+    if WEBHOOK_URL:
+        try:
+            await bot.set_webhook(WEBHOOK_URL)
+            logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
+        except Exception as e:
+            logger.exception(f"Webhook set failed: {e}")
     else:
-        await bot.set_webhook(WEBHOOK_URL)
-        logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
+        logger.warning("WEBHOOK_URL تعریف نشده. لطفاً در env ست کن (https://<render>.onrender.com/webhook)")
 
 async def on_shutdown(app: web.Application):
-    await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("🧹 Webhook deleted")
-    await bot.session.close()
-    logger.info("🧹 Bot session closed")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("🧹 Webhook deleted")
+    finally:
+        await bot.session.close()
+        logger.info("🧹 Bot session closed")
 
 async def health_handler(request: web.Request):
     return web.Response(text="OK")
@@ -224,9 +253,7 @@ async def health_handler(request: web.Request):
 def main():
     from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
     app = web.Application()
-    # مسیر سلامت برای رندر
-    app.router.add_get("/", health_handler)
-    # ثبت وب‌هوک
+    app.router.add_get("/", health_handler)               # مسیر سلامت
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
     setup_application(app, dp, bot=bot)
     app.on_startup.append(on_startup)
@@ -234,5 +261,4 @@ def main():
     return app
 
 if __name__ == "__main__":
-    # فقط aiohttp؛ بدون uvicorn
     web.run_app(main(), host="0.0.0.0", port=PORT)
