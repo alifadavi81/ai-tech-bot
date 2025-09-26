@@ -13,24 +13,26 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ------------------ تنظیمات ------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL")  # Render injects this for Web Services
+WEBHOOK_PATH = "/webhook"
+assert BOT_TOKEN, "BOT_TOKEN env var is required"
+assert BASE_URL, "RENDER_EXTERNAL_URL env var is required (Render Web Service)"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-tech-bot")
 
 dp = Dispatcher()
-bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 # ------------------ حافظه ساده ------------------
-USER_MODE = {}      # حالت کاربر (py یا None)
-EXT_RESULTS = {}    # نتایج آخرین جستجو
-MAX_TEXT_LEN = 4000 # محدودیت تلگرام
+USER_MODE = {}
+EXT_RESULTS = {}
+MAX_TEXT_LEN = 4000
 
 def reset_mode(uid):
     USER_MODE[uid] = None
@@ -204,19 +206,37 @@ async def ext_open(cb: CallbackQuery):
         await cb.message.answer_document(doc, caption=caption)
     await cb.answer()
 
-# ------------------ اجرای بات (فقط Webhook) ------------------
+# ------------------ Webhook server (aiohttp) ------------------
 async def on_startup(app: web.Application):
-    logger.info("✅ Bot started")
+    webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
+    await bot.set_webhook(webhook_url, drop_pending_updates=True)
+    logger.info(f"✅ Webhook set: {webhook_url}")
 
+async def on_shutdown(app: web.Application):
+    await bot.session.close()
+    logger.info("🧹 Bot session closed")
 
-def main():
-    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+async def health(request: web.Request):
+    return web.Response(text="ok")
+
+def create_app():
     app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
+    # health/landing routes
+    app.router.add_get("/", health)
+    app.router.add_get("/healthz", health)
+
+    # telegram webhook route
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+
+    # lifecycle
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    # let aiogram wire background tasks
     setup_application(app, dp, bot=bot)
     return app
 
-
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("bot:main", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    app = create_app()
+    port = int(os.environ.get("PORT", "10000"))
+    web.run_app(app, host="0.0.0.0", port=port)
