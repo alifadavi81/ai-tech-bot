@@ -1,14 +1,13 @@
 import os
 import logging
-import asyncio
-import httpx
 import html as _html
+import httpx
 from dotenv import load_dotenv
-
 from aiohttp import web
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
-from aiogram.types import Message, CallbackQuery, BufferedInputFile, Update
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -16,85 +15,40 @@ from aiogram.filters import Command
 # ------------------ تنظیمات ------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else None
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # مثلا: https://your-service.onrender.com/webhook
+PORT = int(os.getenv("PORT", "10000"))
 
-assert BOT_TOKEN, "BOT_TOKEN env var is required"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-tech-bot")
 
 dp = Dispatcher()
-bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 # ------------------ حافظه ساده ------------------
 USER_MODE = {}      # حالت کاربر (py یا None)
 EXT_RESULTS = {}    # نتایج آخرین جستجو
 MAX_TEXT_LEN = 4000 # محدودیت تلگرام
-MAX_RESULTS_CACHE = 10  # برای جلوگیری از رشد بی‌نهایت حافظه
 
 def reset_mode(uid: int):
     USER_MODE[uid] = None
 
-def _cache_results(uid: int, results):
-    # نگهداری نتایج برای کاربر و محدود کردن اندازه
-    EXT_RESULTS[uid] = results[:MAX_RESULTS_CACHE]
-
 # ------------------ ابزارهای کمکی ------------------
-def _github_headers():
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "ai-tech-bot/1.0",
-    }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    return headers
+async def _http_get_json(url, params=None, headers=None):
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
-async def _http_get_json(url, params=None, headers=None, timeout=20):
-    # retry سبک برای جلوگیری از هنگ در خطاهای گذرا
-    headers = {**(_github_headers() if headers is None else headers)}
-    retry_delays = [0.5, 1.0, 2.0]
-    last_exc = None
-    for delay in retry_delays:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.get(url, params=params, headers=headers)
-                if r.status_code in (403, 429):
-                    # معمولاً rate limit گیت‌هاب
-                    text = r.text
-                    raise RuntimeError("GitHub rate limit or forbidden. Set GITHUB_TOKEN. "
-                                       f"status={r.status_code} body={text[:200]}")
-                r.raise_for_status()
-                return r.json()
-        except Exception as e:
-            last_exc = e
-            await asyncio.sleep(delay)
-    raise last_exc
-
-async def fetch_text(url, timeout=20):
-    retry_delays = [0.5, 1.0]
-    last_exc = None
-    for delay in retry_delays:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.get(url, headers=_github_headers())
-                r.raise_for_status()
-                return r.text
-        except Exception as e:
-            last_exc = e
-            await asyncio.sleep(delay)
-    raise last_exc
+async def fetch_text(url):
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.text
 
 def _to_raw_url(html_repo, path, branch):
     return f"{html_repo.replace('https://github.com', 'https://raw.githubusercontent.com')}/{branch}/{path}"
 
-async def safe_edit(msg: types.Message, text: str, reply_markup=None):
+async def safe_edit(msg: Message, text: str, reply_markup=None):
     try:
         await msg.edit_text(text, reply_markup=reply_markup, disable_web_page_preview=True)
     except Exception:
@@ -109,7 +63,7 @@ async def github_code_search(q: str, per_page=5):
     for item in data.get("items", []):
         repo = item.get("repository", {})
         html_repo = repo.get("html_url", "")
-        default_branch = repo.get("default_branch", "main")
+        default_branch = repo.get("default_branch") or "main"
         path = item.get("path")
         raw_url = _to_raw_url(html_repo, path, default_branch)
         results.append({
@@ -165,11 +119,6 @@ async def py_exit(cb: CallbackQuery):
     await safe_edit(cb.message, "✅ از حالت پایتون خارج شدی. از منوی اصلی انتخاب کن.")
     await cb.answer()
 
-@dp.callback_query(F.data == "py_more")
-async def py_more(cb: CallbackQuery):
-    await cb.message.answer("🔁 لطفاً یک کلیدواژهٔ جدید بفرست تا جستجوی بیشتری انجام بدم.")
-    await cb.answer()
-
 # ------------------ Global GitHub search ------------------
 @dp.callback_query(F.data == "search")
 async def do_search(cb: CallbackQuery):
@@ -186,7 +135,7 @@ async def handle_query(msg: Message):
     mode = USER_MODE.get(msg.from_user.id)
 
     if mode == "py":
-        info_msg = await msg.answer("⏳ در حال جستجوی پایتون (GitHub code)...")
+        await msg.answer("⏳ در حال جستجوی پایتون (GitHub code)...")
         try:
             query = f'{q} language:python in:file'
             results = await github_code_search(query, per_page=5)
@@ -194,35 +143,35 @@ async def handle_query(msg: Message):
                 query2 = f'{q} language:python filename:README in:file'
                 results = await github_code_search(query2, per_page=5)
             if not results:
-                await safe_edit(info_msg, "❌ چیزی پیدا نشد. یک کلیدواژه‌ی ساده‌تر امتحان کن.")
+                await msg.answer("❌ چیزی پیدا نشد. یک کلیدواژه‌ی ساده‌تر امتحان کن.")
                 return
 
-            _cache_results(msg.from_user.id, results)
+            EXT_RESULTS[msg.from_user.id] = results
             kb = InlineKeyboardBuilder()
             for i, r in enumerate(results):
                 kb.button(text=f"{r['name']} 📂 {r['repo']}", callback_data=f"ext_open_{i}")
             kb.button(text="🔄 جستجوی بیشتر", callback_data="py_more")
             kb.adjust(1)
-            await safe_edit(info_msg, "📌 <b>نتایج پایتون:</b>", reply_markup=kb.as_markup())
+            await msg.answer("📌 <b>نتایج پایتون:</b>", reply_markup=kb.as_markup())
         except Exception as e:
-            await safe_edit(info_msg, f"⚠️ خطا در جستجوی پایتون: {e}")
+            await msg.answer(f"⚠️ خطا در جستجوی پایتون: {e}")
         return
 
     # حالت عادی
-    info_msg = await msg.answer("⏳ در حال جستجو روی GitHub...")
+    await msg.answer("⏳ در حال جستجو روی GitHub...")
     try:
         results = await github_code_search(q, per_page=5)
         if not results:
-            await safe_edit(info_msg, "❌ چیزی پیدا نشد.")
+            await msg.answer("❌ چیزی پیدا نشد.")
             return
-        _cache_results(msg.from_user.id, results)
+        EXT_RESULTS[msg.from_user.id] = results
         kb = InlineKeyboardBuilder()
         for i, r in enumerate(results):
             kb.button(text=f"{r['name']} 📂 {r['repo']}", callback_data=f"ext_open_{i}")
         kb.adjust(1)
-        await safe_edit(info_msg, "📌 <b>نتایج جستجو:</b>", reply_markup=kb.as_markup())
+        await msg.answer("📌 <b>نتایج جستجو:</b>", reply_markup=kb.as_markup())
     except Exception as e:
-        await safe_edit(info_msg, f"⚠️ خطا: {e}")
+        await msg.answer(f"⚠️ خطا: {e}")
 
 # ------------------ Open external code ------------------
 @dp.callback_query(F.data.startswith("ext_open_"))
@@ -239,8 +188,8 @@ async def ext_open(cb: CallbackQuery):
     item = items[idx]
     try:
         code = await fetch_text(item["raw_url"])
-    except Exception as e:
-        await cb.message.answer(f"❌ دانلود کد ناموفق بود: {e}")
+    except Exception:
+        await cb.message.answer("❌ دانلود کد ناموفق بود.")
         await cb.answer()
         return
     caption = f"🔗 <a href='{item['html_url']}'>مشاهده در GitHub</a>\n⚠️ لایسنس رو چک کن."
@@ -252,52 +201,38 @@ async def ext_open(cb: CallbackQuery):
         await cb.message.answer_document(doc, caption=caption)
     await cb.answer()
 
-# ------------------ Webhook server (aiohttp) ------------------
+# ------------------ Webhook با aiohttp ------------------
 async def on_startup(app: web.Application):
-    if WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True, secret_token=WEBHOOK_SECRET or None)
-        logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
+    # ست‌کردن وب‌هوک (یکبار)
+    if not WEBHOOK_URL:
+        # اگر تنظیم نکردی، از URL رندر + /webhook استفاده کن
+        # مثلا https://your-service.onrender.com/webhook
+        logger.warning("WEBHOOK_URL تعریف نشده. لطفاً در env ست کن.")
     else:
-        logger.warning("⚠️ RENDER_EXTERNAL_URL not set; webhook not configured.")
+        await bot.set_webhook(WEBHOOK_URL)
+        logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
 
 async def on_shutdown(app: web.Application):
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("🧹 Webhook deleted")
     await bot.session.close()
     logger.info("🧹 Bot session closed")
 
-async def health(request: web.Request):
-    return web.Response(text="ok")
+async def health_handler(request: web.Request):
+    return web.Response(text="OK")
 
-async def webhook(request: web.Request):
-    # اعتبارسنجی درخواست از طرف تلگرام
-    if WEBHOOK_SECRET:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-            return web.Response(status=403, text="forbidden")
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="bad json")
-
-    try:
-        update = Update.model_validate(data)
-        await dp.feed_update(bot, update)
-    except Exception as e:
-        logger.exception("Failed to process update: %s", e)
-        return web.Response(status=500, text="error")
-    return web.json_response({"ok": True})
-
-def create_app():
+def main():
+    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
     app = web.Application()
-    # health/landing routes
-    app.router.add_get("/", health)
-    app.router.add_get("/healthz", health)
-    # telegram webhook route
-    app.router.add_post(WEBHOOK_PATH, webhook)
-    # lifecycle
+    # مسیر سلامت برای رندر
+    app.router.add_get("/", health_handler)
+    # ثبت وب‌هوک
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
+    setup_application(app, dp, bot=bot)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     return app
 
 if __name__ == "__main__":
-    app = create_app()
-    port = int(os.environ.get("PORT", "10000"))
-    web.run_app(app, host="0.0.0.0", port=port)
+    # فقط aiohttp؛ بدون uvicorn
+    web.run_app(main(), host="0.0.0.0", port=PORT)
