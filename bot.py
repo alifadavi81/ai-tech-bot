@@ -33,25 +33,17 @@ bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 MAX_TEXT_LEN = 4000
 
 # ================== In-Memory ==================
-# USER_STATE[user_id] = {
-#   "mode": "py" | "search" | None,
-#   "domain": "robotics" | "iot" | None,
-#   "facet": "schematic" | "code" | "parts" | "guide" | None,
-#   "last_q": "آخرین عبارت جستجو"
-# }
+# USER_STATE[user_id] = {"mode": "py"|"search"|None, "domain": "robotics"|"iot"|None, "facet": "schematic"|"code"|"parts"|"guide"|None}
 USER_STATE = {}
 EXT_RESULTS = {}   # نتایج GitHub و DB برای هر کاربر
 
 def reset_state(uid: int):
-    USER_STATE[uid] = {"mode": None, "domain": None, "facet": None, "last_q": ""}
+    USER_STATE[uid] = {"mode": None, "domain": None, "facet": None}
 
 # ================== Local DB (projects.json) ==================
-# ساختار پیشنهادی:
-# {
-#   "robotics": [ { id,title,desc,tags[], code, schematic, parts, guide } ],
-#   "iot":      [ ... ],
-#   "py_libs":  [ ... ]   # اختیاری
-# }
+# ساختار قابل‌قبول:
+# 1) شیء با کلیدهای robotics/iot/py_libs که هر کدام آرایه‌ای از آیتم‌ها هستند
+# 2) یا آرایه‌ی ساده که به robotics نسبت داده می‌شود
 DB = {"robotics": [], "iot": [], "py_libs": []}
 
 def load_projects_json():
@@ -109,16 +101,9 @@ def norm(s: str) -> str:
     return (s or "").lower()
 
 def text_like(t: str, q: str) -> bool:
-    # نرم‌تر برای فارسی/انگلیسی: حداقل نیمی از واژه‌ها باید وجود داشته باشه
     t = norm(t); q = norm(q)
-    q = re.sub(r"\s+", " ", q).strip()
-    if not q:
-        return True
-    words = [w for w in q.split(" ") if w]
-    if not words:
-        return True
-    hits = sum(1 for w in words if w in t)
-    return hits >= max(1, len(words) // 2)
+    q = re.sub(r"\s+", " ", q)
+    return all(word in t for word in q.split())
 
 def pick_nonempty_fields(item, fields):
     return [f for f in fields if (item.get(f) and str(item.get(f)).strip())]
@@ -148,44 +133,139 @@ def local_search(domain: str, facet: str, query: str, limit=8):
             break
     return results
 
-# ================== GitHub Search (facet-aware) ==================
-def build_github_query(domain: str, facet: str, user_query: str) -> str:
-    q = (user_query or "").strip()
-    parts = []
+# ================== GitHub Search (facet-aware, multi-query) ==================
+def build_github_queries(domain: str, facet: str, user_query: str) -> list[str]:
+    """
+    به‌جای یک کوئری پیچیده، چند کوئری سبک و معتبر برای GitHub Code Search می‌سازیم.
+    بدون پرانتز، بدون fork:false. اگر لازم شد، هر seed یک کوئری مجزا می‌شود.
+    """
+    base = user_query.strip()
+    queries: list[str] = []
 
     if facet == "code":
-        langs = ["arduino", "c", "cpp"]
         if domain == "iot":
-            langs += ["python", "javascript", "micropython", "typescript"]
-        lang_q = " OR ".join([f"language:{l}" for l in langs])
-        parts.append(f"({lang_q})")
-        parts.append("in:file")
+            langs = ["arduino", "c", "cpp", "python", "javascript"]
+        else:
+            langs = ["arduino", "c", "cpp"]
+        for l in langs:
+            queries.append(f"{base} language:{l} in:file")
 
     elif facet == "schematic":
         sch_terms = [
-            "extension:sch", "extension:kicad_sch", "extension:kicad_pcb",
-            "extension:fzz", "eagle", "kicad", "fritzing", "schematic"
+            "extension:sch",
+            "extension:kicad_sch",
+            "extension:kicad_pcb",
+            "extension:fzz",
+            "kicad",
+            "eagle",
+            "fritzing",
+            "schematic",
         ]
-        parts.append("(" + " OR ".join(sch_terms) + ")")
-        parts.append("in:path")
+        for t in sch_terms:
+            queries.append(f"{base} {t} in:path")
 
     elif facet == "parts":
-        parts.append('("BOM" OR "bill of materials" OR "parts list" OR components)')
-        parts.append("(filename:README.md OR filename:BOM OR filename:parts.txt OR filename:bill_of_materials.csv)")
-        parts.append("in:file")
+        seeds = [
+            'BOM in:file',
+            '"bill of materials" in:file',
+            '"parts list" in:file',
+            'components in:file',
+            'filename:README.md in:file',
+            'filename:BOM in:file',
+            'filename:parts.txt in:file',
+            'filename:bill_of_materials.csv in:file'
+        ]
+        for s in seeds:
+            queries.append(f"{base} {s}")
 
     elif facet == "guide":
-        parts.append("(filename:README.md OR path:docs OR path:hardware OR path:design)")
-        parts.append('("hardware design" OR schematic OR setup OR wiring OR assembly)')
-        parts.append("in:file")
+        seeds = [
+            'filename:README.md in:file',
+            'path:docs in:path',
+            'path:hardware in:path',
+            'path:design in:path',
+            '"hardware design" in:file',
+            'schematic in:file',
+            'setup in:file',
+            'wiring in:file',
+            'assembly in:file',
+        ]
+        for s in seeds:
+            queries.append(f"{base} {s}")
+    else:
+        queries.append(f"{base} in:file")
 
-    # فورک‌ها را حذف کن — سینتکس درست:
-    parts.append("fork:false")
+    # حذف تکراری‌ها
+    uniq, seen = [], set()
+    for q in queries:
+        q2 = re.sub(r"\s+", " ", q).strip()
+        if q2 and q2 not in seen:
+            uniq.append(q2)
+            seen.add(q2)
+    return uniq[:10]
 
-    full = " ".join([q] + parts).strip()
-    full = re.sub(r"\s+", " ", full)
-    return full
+async def github_code_search_multi(queries: list[str], per_page=5, cap=8):
+    """
+    چند کوئری سبک را یکی‌یکی می‌زند تا به cap نتیجه برسیم.
+    اگر 422 بیاید، کوئری ساده‌تر می‌شود (fallback فقط in:file).
+    """
+    all_items = []
+    seen_keys = set()
 
+    async def run_one(q: str):
+        nonlocal all_items
+        try:
+            url = "https://api.github.com/search/code"
+            params = {"q": q, "per_page": str(per_page), "page": "1"}
+            data = await _http_get_json(url, params, headers=_gh_headers())
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 422:
+                # fallback: حذف qualifierها و فقط in:file
+                simple = re.sub(
+                    r'(language:[^\s]+|extension:[^\s]+|filename:[^\s]+|path:[^\s]+|in:(file|path))',
+                    '',
+                    q, flags=re.I
+                )
+                simple = re.sub(r'\s+', ' ', (simple + ' in:file')).strip()
+                try:
+                    url = "https://api.github.com/search/code"
+                    params = {"q": simple, "per_page": str(per_page), "page": "1"}
+                    data = await _http_get_json(url, params, headers=_gh_headers())
+                except Exception:
+                    return
+            else:
+                return
+        except Exception:
+            return
+
+        for item in data.get("items", []):
+            repo = item.get("repository", {})
+            html_repo = repo.get("html_url", "")
+            default_branch = repo.get("default_branch") or "main"
+            path = item.get("path")
+            raw_url = _to_raw_url(html_repo, path, default_branch)
+            key = f"{repo.get('full_name')}/{path}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            all_items.append({
+                "name": item.get("name"),
+                "path": path,
+                "repo": repo.get("full_name"),
+                "html_url": item.get("html_url"),
+                "raw_url": raw_url,
+            })
+            if len(all_items) >= cap:
+                break
+
+    for q in queries:
+        if len(all_items) >= cap:
+            break
+        await run_one(q)
+
+    return all_items
+
+# ================== Old single-call (برای جستجوی آزاد/پایتون)
 async def github_code_search(q: str, per_page=5, page=1):
     url = "https://api.github.com/search/code"
     params = {"q": q, "per_page": str(per_page), "page": str(page)}
@@ -280,7 +360,7 @@ async def facet_select(cb: CallbackQuery):
         "🔎 اول از دیتابیس داخلی می‌گردم، اگر نبود میرم GitHub."
     )
 
-# ---- Free GitHub search
+# ---- Free GitHub search (old)
 @dp.callback_query(F.data == "search_free")
 async def do_search_free(cb: CallbackQuery):
     st = USER_STATE.get(cb.from_user.id) or {}
@@ -288,7 +368,7 @@ async def do_search_free(cb: CallbackQuery):
     await cb.answer()
     await cb.message.answer("🔍 عبارت جستجوی آزاد GitHub رو بفرست (مثال: <code>fastapi language:python in:file</code>)")
 
-# ---- Python mode
+# ---- Python mode (old)
 @dp.callback_query(F.data == "py_home")
 async def py_home(cb: CallbackQuery):
     st = USER_STATE.get(cb.from_user.id) or {}
@@ -318,26 +398,22 @@ async def handle_query(msg: Message):
     if not q:
         return
 
-    st = USER_STATE.get(msg.from_user.id) or {"mode": None, "domain": None, "facet": None, "last_q": ""}
+    st = USER_STATE.get(msg.from_user.id) or {"mode": None, "domain": None, "facet": None}
 
-    # ذخیره آخرین عبارت برای fallback
-    USER_STATE[msg.from_user.id] = {**st, "last_q": q}
-    st = USER_STATE[msg.from_user.id]
-
-    # Python library search
+    # Python library search (legacy)
     if st["mode"] == "py":
         await msg.answer("⏳ در حال جستجوی پایتون (GitHub code)...")
         try:
-            query = f'{q} language:python in:file fork:false'
+            query = f'{q} language:python in:file'
             results = await github_code_search(query, per_page=5)
             if not results:
-                query2 = f'{q} language:python filename:README in:file fork:false'
+                query2 = f'{q} language:python filename:README in:file'
                 results = await github_code_search(query2, per_page=5)
             if not results:
                 await msg.answer("❌ چیزی پیدا نشد. یک کلیدواژه‌ی ساده‌تر امتحان کن.")
                 return
             EXT_RESULTS[msg.from_user.id] = {"items": results, "source": "github"}
-            kb = results_kb(results, prefix="ext", domain=None, facet=None)
+            kb = results_kb(results, prefix="ext")
             await msg.answer("📌 <b>نتایج پایتون:</b>", reply_markup=kb.as_markup())
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
@@ -348,7 +424,7 @@ async def handle_query(msg: Message):
             await msg.answer(f"⚠️ خطا: {e}")
         return
 
-    # Facet/domain search (robotics/iot)
+    # Facet/domain search (new)
     if st["mode"] == "search" and st["domain"] and st["facet"]:
         domain = st["domain"]
         facet = st["facet"]
@@ -362,10 +438,11 @@ async def handle_query(msg: Message):
 
         await msg.answer("🔁 چیزی در محلی نبود؛ می‌رم GitHub...")
         try:
-            gh_q = build_github_query(domain, facet, q)
-            results = await github_code_search(gh_q, per_page=5)
+            queries = build_github_queries(domain, facet, q)
+            results = await github_code_search_multi(queries, per_page=5, cap=8)
             if not results and facet != "code":
-                results = await github_code_search(q + " in:file fork:false", per_page=5)
+                # تلاش دوم: آزادتر
+                results = await github_code_search_multi([q + " in:file"], per_page=5, cap=8)
             if not results:
                 await msg.answer("❌ چیزی پیدا نشد. کلیدواژه‌ی دقیق‌تر بده.")
                 return
@@ -381,7 +458,7 @@ async def handle_query(msg: Message):
             await msg.answer(f"⚠️ خطا: {e}")
         return
 
-    # Free GitHub search
+    # Free GitHub search (legacy)
     await msg.answer("⏳ در حال جستجوی آزاد روی GitHub...")
     try:
         results = await github_code_search(q, per_page=5)
@@ -441,40 +518,16 @@ async def local_open(cb: CallbackQuery):
         await cb.message.answer_document(doc, caption=f"📄 {FACETS[facet]['label']}")
     await cb.answer()
 
-# ---- Fallback to GitHub from local UI (با last_q)
+# ---- Fallback to GitHub from local UI
 @dp.callback_query(F.data.startswith("fallback_"))
 async def do_fallback(cb: CallbackQuery):
     _, domain, facet = cb.data.split("_", 2)
-    st = USER_STATE.get(cb.from_user.id) or {}
-    last_q = (st.get("last_q") or "").strip()
-
-    USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": facet}
-
-    if last_q:
-        await cb.message.answer("🔁 ادامه با همان عبارت قبلی روی GitHub...")
-        try:
-            gh_q = build_github_query(domain, facet, last_q)
-            results = await github_code_search(gh_q, per_page=5)
-            if not results and facet != "code":
-                results = await github_code_search(last_q + " in:file fork:false", per_page=5)
-            if results:
-                EXT_RESULTS[cb.from_user.id] = {"items": results, "source": "github", "domain": domain, "facet": facet}
-                kb = results_kb(results, prefix="ext")
-                await cb.message.answer(f"📌 <b>نتایج GitHub ({FACETS[facet]['label']}):</b>", reply_markup=kb.as_markup())
-                await cb.answer()
-                return
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 403:
-                await cb.message.answer("⚠️ GitHub rate limit. اگر شد در env یک GITHUB_TOKEN ست کن.")
-            else:
-                await cb.message.answer(f"⚠️ خطای GitHub: {e}")
-        except Exception as e:
-            await cb.message.answer(f"⚠️ خطا: {e}")
-
     await cb.message.answer(
-        f"برای ادامه جستجو در GitHub ({FACETS[facet]['label']}), یک عبارت بفرست.\n"
+        f"🔁 برای ادامه جستجو در GitHub ({FACETS[facet]['label']}), یک عبارت بفرست.\n"
         "مثلاً: <code>line follower</code> یا <code>ESP32 MQTT</code>"
     )
+    st = USER_STATE.get(cb.from_user.id) or {}
+    USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": facet}
     await cb.answer()
 
 # ---- Open External (GitHub) item
@@ -545,5 +598,4 @@ def main():
     return app
 
 if __name__ == "__main__":
-    # روی Render حتماً Web Service باشه و PORT ست باشه تا روشن بمونه
     web.run_app(main(), host="0.0.0.0", port=PORT)
