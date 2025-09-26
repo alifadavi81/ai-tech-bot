@@ -229,7 +229,11 @@ def main():
 
 if __name__ == "__main__":
     import asyncio
-    from aiogram import executor
-    executor.start_polling(dp, skip_updates=True)
+
+    async def main_polling():
+        await dp.start_polling(bot, skip_updates=True)
+
+    asyncio.run(main_polling())
+
 
 # force update test
