@@ -10,8 +10,21 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+import os
+import json
+import logging
+import html as _html
+from pathlib import Path
+from dotenv import load_dotenv
+
+import httpx
 from aiohttp import web
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
+from aiogram.enums import ParseMode
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
 
 # ------------------ تنظیمات ------------------
 load_dotenv()
@@ -78,7 +91,7 @@ async def github_code_search(q: str, per_page=5):
     return results
 
 # ------------------ Start & Menu ------------------
-@dp.message(types.Message, commands={"start"})
+@dp.message(Command("start"))
 async def start(msg: Message):
     reset_mode(msg.from_user.id)
     kb = InlineKeyboardBuilder()
@@ -219,7 +232,4 @@ if __name__ == "__main__":
     from aiogram import executor
     executor.start_polling(dp, skip_updates=True)
 
-
 # force update test
-
-
