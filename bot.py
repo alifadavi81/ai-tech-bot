@@ -1,4 +1,4 @@
-# bot.py (patched: fix callback parsing for find_parts/find_schematic and catch TelegramForbiddenError)
+# bot.py (patched: add back button everywhere + spinner timeout + callback fixes)
 import os
 import json
 import re
@@ -227,7 +227,7 @@ async def github_code_search_multi(queries: list[str], per_page=5, cap=8):
 
     return all_items
 
-# ================== UI Builders (no Home button anywhere) ==================
+# ================== UI Builders ==================
 def main_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🤖 رباتیک", callback_data="cat_robotics")
@@ -246,6 +246,8 @@ def projects_list_kb(domain: str):
         for i, it in enumerate(items):
             title = it.get("title") or it.get("id") or f"item {i+1}"
             kb.button(text=f"• {title[:48]}", callback_data=f"proj_{domain}_{i}")
+    # بازگشت به منوی اصلی
+    kb.button(text="⬅️ بازگشت به منو اصلی", callback_data="back_main")
     kb.adjust(1)
     return kb
 
@@ -269,19 +271,33 @@ def results_kb(items, prefix="local", domain=None, facet=None):
         kb.button(text=f"{title[:48]}", callback_data=f"{prefix}_open_{i}")
     if prefix == "local" and domain and facet:
         kb.button(text="🔎 ادامه در GitHub", callback_data=f"fallback_{domain}_{facet}")
+    # بازگشت: اگر domain مشخص باشه به همون domain برمی‌گرده، وگرنه به منوی اصلی
+    if domain:
+        kb.button(text="⬅️ بازگشت", callback_data=f"back_to_{domain}")
+    else:
+        kb.button(text="⬅️ بازگشت به منو اصلی", callback_data="back_main")
     kb.adjust(1)
     return kb
 
-# ================== Spinner (animated "در حال جستجو...") ==================
-async def with_spinner(msg_obj, base_text: str, coro):
+# ================== Spinner (animated + timeout) ==================
+async def with_spinner(msg_obj, base_text: str, coro, timeout=30):
     spinner_chars = ["⏳", "🔎", "⌛️"]
     dots = ["", ".", "..", "..."]
     edit_msg = msg_obj
     task = asyncio.create_task(coro)
     try:
         i = 0
+        start = asyncio.get_event_loop().time()
         while not task.done():
-            s = f"{spinner_chars[i % len(spinner_chars)]} {base_text}{dots[i % len(dots)]}"
+            elapsed = int(asyncio.get_event_loop().time() - start)
+            if elapsed > timeout:
+                task.cancel()
+                try:
+                    await edit_msg.edit_text("⏰ زمان جستجو تمام شد.")
+                except Exception:
+                    pass
+                return None
+            s = f"{spinner_chars[i % len(spinner_chars)]} {base_text}{dots[i % len(dots)]} ({elapsed}s)"
             try:
                 await edit_msg.edit_text(s)
             except Exception:
@@ -290,11 +306,11 @@ async def with_spinner(msg_obj, base_text: str, coro):
             await asyncio.sleep(0.9)
         return await task
     finally:
-        try:
-            if task.cancelled():
+        if task.cancelled():
+            try:
                 await edit_msg.edit_text("❌ جستجو لغو شد.")
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 # ================== Handlers ==================
 @dp.message(Command("start"))
@@ -328,9 +344,16 @@ async def cat_iot(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("back_to_"))
 async def back_to_domain(cb: CallbackQuery):
-    domain = cb.data.split("_", 2)[2]
-    await safe_edit(cb.message, ("🤖 لیست پروژه‌های رباتیک:" if domain=="robotics" else "🌐 لیست پروژه‌های اینترنت اشیا:"), 
-                    reply_markup=projects_list_kb(domain).as_markup())
+    # callback_data format: back_to_<domain>
+    parts = cb.data.split("_", 2)
+    domain = parts[2] if len(parts) > 2 else None
+    if domain == "robotics":
+        await safe_edit(cb.message, "🤖 لیست پروژه‌های رباتیک:", reply_markup=projects_list_kb("robotics").as_markup())
+    elif domain == "iot":
+        await safe_edit(cb.message, "🌐 لیست پروژه‌های اینترنت اشیا:", reply_markup=projects_list_kb("iot").as_markup())
+    else:
+        # fallback to main menu
+        await safe_edit(cb.message, "🏠 منوی اصلی:", reply_markup=main_menu_kb().as_markup())
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("proj_"))
@@ -422,7 +445,7 @@ async def find_parts(cb: CallbackQuery):
         await cb.message.answer("❌ چیزی برای قطعه‌ها پیدا نشد.")
     else:
         EXT_RESULTS[cb.from_user.id] = {"items": results, "source": "github", "domain": domain, "facet": "parts"}
-        kb = results_kb(results, prefix="ext")
+        kb = results_kb(results, prefix="ext", domain=domain, facet="parts")
         await cb.message.answer("📌 <b>نتایج قطعه‌ها (BOM/parts):</b>", reply_markup=kb.as_markup())
     await cb.answer()
 
@@ -445,7 +468,7 @@ async def find_schematic(cb: CallbackQuery):
         await cb.message.answer("❌ چیزی برای شماتیک پیدا نشد.")
     else:
         EXT_RESULTS[cb.from_user.id] = {"items": results, "source": "github", "domain": domain, "facet": "schematic"}
-        kb = results_kb(results, prefix="ext")
+        kb = results_kb(results, prefix="ext", domain=domain, facet="schematic")
         await cb.message.answer("📌 <b>نتایج شماتیک:</b>", reply_markup=kb.as_markup())
     await cb.answer()
 
@@ -462,7 +485,8 @@ async def py_home(cb: CallbackQuery):
     USER_STATE[cb.from_user.id] = {**st, "mode": "py", "domain": "python", "facet": "code"}
     kb = InlineKeyboardBuilder()
     kb.button(text="🚪 خروج از حالت پایتون", callback_data="py_exit")
-    kb.adjust(1)
+    kb.button(text="⬅️ بازگشت به منو اصلی", callback_data="back_main")
+    kb.adjust(2)
     await safe_edit(
         cb.message,
         "🐍 <b>جستجوی پایتون (محلی + GitHub)</b>\n"
@@ -474,7 +498,7 @@ async def py_home(cb: CallbackQuery):
 @dp.callback_query(F.data == "py_exit")
 async def py_exit(cb: CallbackQuery):
     reset_state(cb.from_user.id)
-    await safe_edit(cb.message, "✅ از حالت پایتون خارج شدی.")
+    await safe_edit(cb.message, "✅ از حالت پایتون خارج شدی.", reply_markup=main_menu_kb().as_markup())
     await cb.answer()
 
 @dp.message()
@@ -500,7 +524,7 @@ async def handle_query(msg: Message):
             await msg.answer("❌ چیزی پیدا نشد. یک کلیدواژه‌ی ساده‌تر امتحان کن.")
             return
         EXT_RESULTS[msg.from_user.id] = {"items": res["items"], "source": res["source"]}
-        kb = results_kb(res["items"], prefix="ext")
+        kb = results_kb(res["items"], prefix="ext", domain="python", facet="code")
         await msg.answer("📌 <b>نتایج پایتون:</b>", reply_markup=kb.as_markup())
         return
     if st["mode"] == "search" and st["domain"] and st["facet"]:
@@ -520,7 +544,7 @@ async def handle_query(msg: Message):
             await msg.answer("❌ چیزی پیدا نشد. کلیدواژه‌ی دقیق‌تر بده.")
             return
         EXT_RESULTS[msg.from_user.id] = {"items": res["items"], "source": res["source"], "domain": domain, "facet": facet}
-        kb = results_kb(res["items"], prefix="ext")
+        kb = results_kb(res["items"], prefix="ext", domain=domain, facet=facet)
         await msg.answer(f"📌 <b>نتایج ({domain} / {FACETS[facet]['label']}):</b>", reply_markup=kb.as_markup())
         return
     if st.get("mode") == "search_free":
@@ -631,6 +655,13 @@ async def ext_open(cb: CallbackQuery):
     else:
         doc = BufferedInputFile(code.encode("utf-8"), filename=item["name"] or "snippet.txt")
         await cb.message.answer_document(doc, caption=caption)
+    await cb.answer()
+
+# back to main handler
+@dp.callback_query(F.data == "back_main")
+async def back_main(cb: CallbackQuery):
+    reset_state(cb.from_user.id)
+    await safe_edit(cb.message, "🏠 منوی اصلی:", reply_markup=main_menu_kb().as_markup())
     await cb.answer()
 
 async def on_startup(app: web.Application):
