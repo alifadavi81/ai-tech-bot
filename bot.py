@@ -13,7 +13,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
-    InlineKeyboardMarkup, InlineKeyboardButton, ChatActions
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
@@ -287,7 +287,7 @@ async def send_project_card(chat_id: int, item: dict, domain: str = None, idx: i
         avatar = await github_avatar_for_repo(item.get("repo"))
         if avatar:
             try:
-                await bot.send_chat_action(chat_id=chat_id, action=ChatActions.UPLOAD_PHOTO)
+                await bot.send_chat_action(chat_id=chat_id, action="upload_photo")
                 await bot.send_photo(chat_id, photo=avatar, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
                 thumb_sent = True
             except Exception:
@@ -296,7 +296,7 @@ async def send_project_card(chat_id: int, item: dict, domain: str = None, idx: i
     # fallback: if item has a local thumb_url
     if not thumb_sent and item.get("thumb_url"):
         try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatActions.UPLOAD_PHOTO)
+            await bot.send_chat_action(chat_id=chat_id, action="upload_photo")
             await bot.send_photo(chat_id, photo=item["thumb_url"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
             thumb_sent = True
         except Exception:
@@ -551,7 +551,7 @@ async def find_parts(cb: CallbackQuery):
     USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": "parts"}
     # send chat action (typing)
     try:
-        await bot.send_chat_action(cb.message.chat.id, action=ChatActions.TYPING)
+        await bot.send_chat_action(cb.message.chat.id, action="typing")
     except Exception:
         pass
     sent = await cb.message.answer("🔎 در حال آماده‌سازی جستجو...")
@@ -581,7 +581,7 @@ async def find_schematic(cb: CallbackQuery):
     st = USER_STATE.get(cb.from_user.id) or {}
     USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": "schematic"}
     try:
-        await bot.send_chat_action(cb.message.chat.id, action=ChatActions.TYPING)
+        await bot.send_chat_action(cb.message.chat.id, action="typing")
     except Exception:
         pass
     sent = await cb.message.answer("🔎 در حال آماده‌سازی جستجو...")
@@ -637,7 +637,7 @@ async def handle_query(msg: Message):
 
     # show typing indicator for longer operations
     try:
-        await bot.send_chat_action(msg.chat.id, action=ChatActions.TYPING)
+        await bot.send_chat_action(msg.chat.id, action="typing")
     except Exception:
         pass
 
@@ -826,7 +826,7 @@ async def ext_open(cb: CallbackQuery):
         await cb.answer(); return
     caption = (
         f"🔗 <a href='{item.get('html_url','')}'>مشاهده در GitHub</a>\n"
-        f"📁 <code>{item.get('repo','')}/{item.get('path','')}</code>\n"
+        f"📁 <code>{item.get('repo')}/{item.get('path')}</code>\n"
         f"⚠️ لایسنس رو چک کن."
     )
     safe = _html.escape(code)
@@ -922,4 +922,3 @@ def main():
 
 if __name__ == "__main__":
     web.run_app(main(), host="0.0.0.0", port=PORT)
-
