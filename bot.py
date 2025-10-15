@@ -53,20 +53,26 @@ def load_projects_json():
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # accept either top-level list => robotics, or dict with keys
         if isinstance(data, list):
             DB["robotics"] = data
             logger.info("projects.json به صورت آرایه بود؛ در robotics بارگذاری شد.")
-        elif isinstance(data, dict):
-            for k in ("robotics", "iot", "py_libs", "python"):
-                if isinstance(data.get(k), list):
-                    if k == "py_libs":
-                        DB["python"] = data.get(k, [])
-                        DB["py_libs"] = data.get(k, [])
+            return
+        if isinstance(data, dict):
+            # فقط کلید‌های مورد انتظار را بردار
+            for key in ("robotics", "iot", "python", "py_libs"):
+                if key in data and isinstance(data[key], list):
+                    # map py_libs -> python and py_libs both kept (backward comp)
+                    if key == "py_libs":
+                        DB["py_libs"] = data[key]
+                        # اگر python خالی بود، از py_libs هم استفاده کن
+                        if not DB["python"]:
+                            DB["python"] = data[key]
                     else:
-                        DB[k if k != "py_libs" else "python"] = data.get(k, [])
+                        DB[key] = data[key]
             logger.info("projects.json با ساختار شیء بارگذاری شد.")
-        else:
-            logger.warning("ساختار projects.json نامعتبر است.")
+            return
+        logger.warning("ساختار projects.json نامعتبر است.")
     except Exception as e:
         logger.exception(f"خواندن projects.json خطا داد: {e}")
 
@@ -189,6 +195,7 @@ async def github_code_search_multi(queries: list[str], per_page=5, cap=8):
             params = {"q": q, "per_page": str(per_page), "page": "1"}
             data = await _http_get_json(url, params, headers=_gh_headers())
         except httpx.HTTPStatusError as e:
+            # try simplifying query if GitHub complains (422)
             if e.response.status_code == 422:
                 simple = re.sub(r'(language:[^\s]+|extension:[^\s]+|filename:[^\s]+|path:[^\s]+|in:(file|path))', '', q, flags=re.I)
                 simple = re.sub(r'\s+', ' ', (simple + ' in:file')).strip()
@@ -199,8 +206,11 @@ async def github_code_search_multi(queries: list[str], per_page=5, cap=8):
                 except Exception:
                     return
             else:
+                # other http errors -> log and return
+                logger.warning(f"GitHub search error for query: {q} status={getattr(e.response, 'status_code', 'NA')}")
                 return
-        except Exception:
+        except Exception as e:
+            logger.exception(f"Exception during GitHub search for query '{q}': {e}")
             return
 
         for item in data.get("items", []):
@@ -432,7 +442,10 @@ async def find_parts(cb: CallbackQuery):
     if len(parts) < 4:
         await cb.answer("فرمت نامعتبری دارد.", show_alert=True); return
     domain = parts[2]; idx = int(parts[3])
-    item = DB.get(domain, [])[idx]
+    items = DB.get(domain, [])
+    if idx < 0 or idx >= len(items):
+        await cb.answer("آیتم نامعتبر.", show_alert=True); return
+    item = items[idx]
     title = item.get("title") or item.get("id") or ""
     st = USER_STATE.get(cb.from_user.id) or {}
     USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": "parts"}
@@ -455,7 +468,10 @@ async def find_schematic(cb: CallbackQuery):
     if len(parts) < 4:
         await cb.answer("فرمت نامعتبری دارد.", show_alert=True); return
     domain = parts[2]; idx = int(parts[3])
-    item = DB.get(domain, [])[idx]
+    items = DB.get(domain, [])
+    if idx < 0 or idx >= len(items):
+        await cb.answer("آیتم نامعتبر.", show_alert=True); return
+    item = items[idx]
     title = item.get("title") or item.get("id") or ""
     st = USER_STATE.get(cb.from_user.id) or {}
     USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": "schematic"}
@@ -506,6 +522,8 @@ async def handle_query(msg: Message):
     q = (msg.text or "").strip()
     if not q:
         return
+    # ensure user state exists
+    USER_STATE.setdefault(msg.from_user.id, {"mode": None, "domain": None, "facet": None, "last_domain": None})
     st = USER_STATE.get(msg.from_user.id) or {"mode": None, "domain": None, "facet": None}
     if st["mode"] == "py":
         sent = await msg.answer("⏳ آماده‌سازی جستجوی پایتون...")
@@ -570,6 +588,8 @@ async def handle_query(msg: Message):
         await msg.answer("📌 <b>نتایج جستجو:</b>", reply_markup=kb.as_markup())
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 403:
+            reset = e.response.headers.get("X-RateLimit-Reset")
+            logger.warning(f"GitHub 403 rate limit; reset={reset}")
             await msg.answer("⚠️ GitHub rate limit. اگر شد در env یک GITHUB_TOKEN ست کن.")
         else:
             await msg.answer(f"⚠️ خطای GitHub: {e}")
@@ -578,7 +598,11 @@ async def handle_query(msg: Message):
 
 @dp.callback_query(F.data.startswith("local_open_"))
 async def local_open(cb: CallbackQuery):
-    st = EXT_RESULTS.get(cb.from_user.id) or {}
+    user_id = cb.from_user.id
+    st = EXT_RESULTS.get(user_id)
+    if not st or not st.get("items"):
+        await cb.answer("🔎 نتیجه‌ای مرتبط وجود ندارد — دوباره جستجو کن.", show_alert=True)
+        return
     items = (st.get("items") or [])
     try:
         idx = int(cb.data.split("_", 2)[2])
@@ -626,7 +650,8 @@ async def do_fallback(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("ext_open_"))
 async def ext_open(cb: CallbackQuery):
-    st = EXT_RESULTS.get(cb.from_user.id) or {}
+    user_id = cb.from_user.id
+    st = EXT_RESULTS.get(user_id) or {}
     items = (st.get("items") or [])
     try:
         idx = int(cb.data.split("_", 2)[2])
@@ -663,6 +688,20 @@ async def back_main(cb: CallbackQuery):
     reset_state(cb.from_user.id)
     await safe_edit(cb.message, "🏠 منوی اصلی:", reply_markup=main_menu_kb().as_markup())
     await cb.answer()
+
+# noop handler and fallback for unknown callbacks (UX safety)
+@dp.callback_query(F.data == "noop")
+async def noop_cb(cb: CallbackQuery):
+    await cb.answer("⦿ در دیتابیس موردی وجود ندارد.", show_alert=False)
+
+@dp.callback_query()
+async def unknown_callback(cb: CallbackQuery):
+    # این handler به عنوان fallback برای callbackهای نامشخص عمل می‌کند
+    logger.info(f"Unknown callback received: {cb.data} from {cb.from_user.id}")
+    try:
+        await cb.answer("⦿ این دکمه دیگر معتبر نیست یا من آن را نمی‌شناسم.", show_alert=False)
+    except Exception:
+        pass
 
 async def on_startup(app: web.Application):
     if WEBHOOK_URL:
