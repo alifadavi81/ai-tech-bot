@@ -1,4 +1,4 @@
-# bot.py (patched: add back button everywhere + spinner timeout + callback fixes)
+# bot.py (patched + UI improvements: project card, avatar, chat_action, pagination)
 import os
 import json
 import re
@@ -11,7 +11,10 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.types import (
+    Message, CallbackQuery, BufferedInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton, ChatActions
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -37,7 +40,7 @@ MAX_TEXT_LEN = 4000
 
 # ================== In-Memory ==================
 USER_STATE = {}
-EXT_RESULTS = {}
+EXT_RESULTS = {}  # keyed by user_id: {"items": [...], "source":"github"|"local", "domain":..., "facet":...}
 
 def reset_state(uid: int):
     USER_STATE[uid] = {"mode": None, "domain": None, "facet": None, "last_domain": None}
@@ -237,57 +240,111 @@ async def github_code_search_multi(queries: list[str], per_page=5, cap=8):
 
     return all_items
 
-# ================== UI Builders ==================
-def main_menu_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🤖 رباتیک", callback_data="cat_robotics")
-    kb.button(text="🌐 اینترنت اشیا", callback_data="cat_iot")
-    kb.button(text="🐍 پایتون (جستجوی محلی)", callback_data="py_home")
-    kb.button(text="🔍 جستجوی آزاد GitHub", callback_data="search_free")
-    kb.adjust(2)
-    return kb
+# ================== UI Helpers / Project Card / Avatar ==================
+async def github_avatar_for_repo(full_name: str) -> str | None:
+    """Return owner's avatar_url for a repo (or None)."""
+    try:
+        url = f"https://api.github.com/repos/{full_name}"
+        data = await _http_get_json(url, headers=_gh_headers())
+        owner = data.get("owner", {})
+        return owner.get("avatar_url")
+    except Exception:
+        return None
 
-def projects_list_kb(domain: str):
-    kb = InlineKeyboardBuilder()
-    items = DB.get(domain, [])
-    if not items:
-        kb.button(text="موردی در دیتابیس نیست", callback_data="noop")
-    else:
-        for i, it in enumerate(items):
-            title = it.get("title") or it.get("id") or f"item {i+1}"
-            kb.button(text=f"• {title[:48]}", callback_data=f"proj_{domain}_{i}")
-    # بازگشت به منوی اصلی
-    kb.button(text="⬅️ بازگشت به منو اصلی", callback_data="back_main")
-    kb.adjust(1)
-    return kb
+async def send_project_card(chat_id: int, item: dict, domain: str = None, idx: int | None = None):
+    """
+    Sends a visually nicer project 'card' with thumbnail (if available), title, short desc and action buttons.
+    domain + idx used to create proper callback_data for open/download actions.
+    """
+    title = _html.escape(item.get("title") or item.get("id") or "پروژه")
+    desc_raw = (item.get("description") or item.get("desc") or "")[:500]
+    desc = _html.escape(desc_raw)
+    caption = f"📦 <b>{title}</b>\n{desc}\n\n"
 
-def language_menu_kb(domain: str, idx: int):
-    item = DB.get(domain, [])[idx]
-    codes = (item.get("code") or {})
-    kb = InlineKeyboardBuilder()
-    for lang_key, label in LANG_LABEL.items():
-        if lang_key in codes:
-            kb.button(text=label, callback_data=f"code_{domain}_{idx}_{lang_key}")
-    kb.button(text="🔎 جستجوی قطعه‌ها", callback_data=f"find_parts_{domain}_{idx}")
-    kb.button(text="🔎 جستجوی شماتیک", callback_data=f"find_schematic_{domain}_{idx}")
-    kb.button(text="⬅️ بازگشت", callback_data=f"back_to_{domain}")
-    kb.adjust(1)
-    return kb
+    kb_rows = []
+    # view on GitHub (url) if available
+    if item.get("html_url"):
+        kb_rows.append([InlineKeyboardButton(text="🔗 مشاهده در GitHub", url=item["html_url"])])
 
-def results_kb(items, prefix="local", domain=None, facet=None):
-    kb = InlineKeyboardBuilder()
-    for i, it in enumerate(items):
-        title = it.get("title") or it.get("name") or it.get("path") or "item"
-        kb.button(text=f"{title[:48]}", callback_data=f"{prefix}_open_{i}")
+    # Open code / parts / schematic callbacks depending on domain/idx and available fields
+    if domain is not None and idx is not None:
+        # provide code button if exists
+        codes = (item.get("code") or {})
+        if codes:
+            kb_rows.append([InlineKeyboardButton(text="💻 باز کردن کد", callback_data=f"proj_{domain}_{idx}")])
+        # specific quick-search buttons
+        kb_rows.append([InlineKeyboardButton(text="🔎 جستجوی قطعه‌ها", callback_data=f"find_parts_{domain}_{idx}")])
+        kb_rows.append([InlineKeyboardButton(text="🔎 جستجوی شماتیک", callback_data=f"find_schematic_{domain}_{idx}")])
+
+    # back button
+    kb_rows.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data=f"back_to_{domain}" if domain else "back_main")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    # Try to use avatar/thumbnail if repo info present
+    thumb_sent = False
+    if item.get("repo"):
+        avatar = await github_avatar_for_repo(item.get("repo"))
+        if avatar:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatActions.UPLOAD_PHOTO)
+                await bot.send_photo(chat_id, photo=avatar, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+                thumb_sent = True
+            except Exception:
+                thumb_sent = False
+
+    # fallback: if item has a local thumb_url
+    if not thumb_sent and item.get("thumb_url"):
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatActions.UPLOAD_PHOTO)
+            await bot.send_photo(chat_id, photo=item["thumb_url"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+            thumb_sent = True
+        except Exception:
+            thumb_sent = False
+
+    if not thumb_sent:
+        # plain message
+        await bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+# ================== Results keyboard (one button per row) + pagination for ext results ==================
+def results_kb(items, prefix="local", domain=None, facet=None, page: int = 0, page_size: int = 8):
+    """
+    Build an InlineKeyboardMarkup where each row contains one button (better readability).
+    For prefix == 'ext' and len(items) > page_size, include Previous/Next buttons with callback data 'ext_page_{page}'.
+    Items list should be the full list (pagination slicing done here).
+    """
+    start = page * page_size
+    end = start + page_size
+    slice_items = items[start:end]
+
+    kb_rows = []
+    for i, it in enumerate(slice_items, start=start):
+        title = (it.get("title") or it.get("name") or it.get("path") or "item")[:48]
+        # Show an extra small "🔗" suffix if html_url exists (visual cue)
+        label = f"{title} {'🔗' if it.get('html_url') else ''}"
+        kb_rows.append([InlineKeyboardButton(text=label, callback_data=f"{prefix}_open_{i}")])
+
+    # If ext and many items -> pagination
+    if prefix == "ext" and len(items) > page_size:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="⏮️ قبلی", callback_data=f"ext_page_{page-1}"))
+        if end < len(items):
+            nav_row.append(InlineKeyboardButton(text="⏭️ بعدی", callback_data=f"ext_page_{page+1}"))
+        if nav_row:
+            kb_rows.append(nav_row)
+
+    # Fallback / continue in GitHub for local origin
     if prefix == "local" and domain and facet:
-        kb.button(text="🔎 ادامه در GitHub", callback_data=f"fallback_{domain}_{facet}")
-    # بازگشت: اگر domain مشخص باشه به همون domain برمی‌گرده، وگرنه به منوی اصلی
+        kb_rows.append([InlineKeyboardButton(text="🔎 ادامه در GitHub", callback_data=f"fallback_{domain}_{facet}")])
+
+    # Back button
     if domain:
-        kb.button(text="⬅️ بازگشت", callback_data=f"back_to_{domain}")
+        kb_rows.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data=f"back_to_{domain}")])
     else:
-        kb.button(text="⬅️ بازگشت به منو اصلی", callback_data="back_main")
-    kb.adjust(1)
-    return kb
+        kb_rows.append([InlineKeyboardButton(text="⬅️ بازگشت به منو اصلی", callback_data="back_main")])
+
+    return InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
 # ================== Spinner (animated + timeout) ==================
 async def with_spinner(msg_obj, base_text: str, coro, timeout=30):
@@ -338,6 +395,44 @@ async def start(msg: Message):
     except Exception as e:
         logger.exception(f"خطا در ارسال /start: {e}")
 
+# --- Menus (kept same) ---
+def main_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🤖 رباتیک", callback_data="cat_robotics")
+    kb.button(text="🌐 اینترنت اشیا", callback_data="cat_iot")
+    kb.button(text="🐍 پایتون (جستجوی محلی)", callback_data="py_home")
+    kb.button(text="🔍 جستجوی آزاد GitHub", callback_data="search_free")
+    kb.adjust(2)
+    return kb
+
+def projects_list_kb(domain: str):
+    kb = InlineKeyboardBuilder()
+    items = DB.get(domain, [])
+    if not items:
+        kb.button(text="موردی در دیتابیس نیست", callback_data="noop")
+    else:
+        for i, it in enumerate(items):
+            title = it.get("title") or it.get("id") or f"item {i+1}"
+            kb.button(text=f"• {title[:48]}", callback_data=f"proj_{domain}_{i}")
+    # بازگشت به منوی اصلی
+    kb.button(text="⬅️ بازگشت به منو اصلی", callback_data="back_main")
+    kb.adjust(1)
+    return kb
+
+def language_menu_kb(domain: str, idx: int):
+    item = DB.get(domain, [])[idx]
+    codes = (item.get("code") or {})
+    kb = InlineKeyboardBuilder()
+    for lang_key, label in LANG_LABEL.items():
+        if lang_key in codes:
+            kb.button(text=label, callback_data=f"code_{domain}_{idx}_{lang_key}")
+    kb.button(text="🔎 جستجوی قطعه‌ها", callback_data=f"find_parts_{domain}_{idx}")
+    kb.button(text="🔎 جستجوی شماتیک", callback_data=f"find_schematic_{domain}_{idx}")
+    kb.button(text="⬅️ بازگشت", callback_data=f"back_to_{domain}")
+    kb.adjust(1)
+    return kb
+
+# --- Category handlers ---
 @dp.callback_query(F.data == "cat_robotics")
 async def cat_robotics(cb: CallbackQuery):
     st = USER_STATE.get(cb.from_user.id) or {}
@@ -377,14 +472,19 @@ async def open_project(cb: CallbackQuery):
     if idx < 0 or idx >= len(items):
         await cb.answer("پروژه نامعتبر است.", show_alert=True); return
     it = items[idx]
-    desc = it.get("description") or it.get("desc") or ""
-    title = it.get("title") or it.get("id") or "پروژه"
-    await safe_edit(
-        cb.message,
-        f"📦 <b>{_html.escape(title)}</b>\n{_html.escape(desc)}\n\n"
-        "یک زبان رو انتخاب کن یا از گزینه‌های زیر استفاده کن:",
-        reply_markup=language_menu_kb(domain, idx).as_markup()
-    )
+    # send a project card (visual)
+    try:
+        await send_project_card(cb.message.chat.id, it, domain=domain, idx=idx)
+    except Exception:
+        # fallback to textual view
+        desc = it.get("description") or it.get("desc") or ""
+        title = it.get("title") or it.get("id") or "پروژه"
+        await safe_edit(
+            cb.message,
+            f"📦 <b>{_html.escape(title)}</b>\n{_html.escape(desc)}\n\n"
+            "یک زبان رو انتخاب کن یا از گزینه‌های زیر استفاده کن:",
+            reply_markup=language_menu_kb(domain, idx).as_markup()
+        )
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("code_"))
@@ -449,17 +549,22 @@ async def find_parts(cb: CallbackQuery):
     title = item.get("title") or item.get("id") or ""
     st = USER_STATE.get(cb.from_user.id) or {}
     USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": "parts"}
+    # send chat action (typing)
+    try:
+        await bot.send_chat_action(cb.message.chat.id, action=ChatActions.TYPING)
+    except Exception:
+        pass
     sent = await cb.message.answer("🔎 در حال آماده‌سازی جستجو...")
     queries = build_github_queries(domain, "parts", title)
     async def _search():
-        return await github_code_search_multi(queries, per_page=5, cap=8)
+        return await github_code_search_multi(queries, per_page=5, cap=24)  # retrieve more for pagination
     results = await with_spinner(sent, "در حال جستجوی قطعه‌ها در GitHub", _search())
     if not results:
         await cb.message.answer("❌ چیزی برای قطعه‌ها پیدا نشد.")
     else:
         EXT_RESULTS[cb.from_user.id] = {"items": results, "source": "github", "domain": domain, "facet": "parts"}
-        kb = results_kb(results, prefix="ext", domain=domain, facet="parts")
-        await cb.message.answer("📌 <b>نتایج قطعه‌ها (BOM/parts):</b>", reply_markup=kb.as_markup())
+        kb = results_kb(results, prefix="ext", domain=domain, facet="parts", page=0)
+        await cb.message.answer("📌 <b>نتایج قطعه‌ها (BOM/parts):</b>", reply_markup=kb)
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("find_schematic_"))
@@ -475,17 +580,21 @@ async def find_schematic(cb: CallbackQuery):
     title = item.get("title") or item.get("id") or ""
     st = USER_STATE.get(cb.from_user.id) or {}
     USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": "schematic"}
+    try:
+        await bot.send_chat_action(cb.message.chat.id, action=ChatActions.TYPING)
+    except Exception:
+        pass
     sent = await cb.message.answer("🔎 در حال آماده‌سازی جستجو...")
     queries = build_github_queries(domain, "schematic", title)
     async def _search():
-        return await github_code_search_multi(queries, per_page=5, cap=8)
+        return await github_code_search_multi(queries, per_page=5, cap=24)
     results = await with_spinner(sent, "در حال جستجوی شماتیک در GitHub", _search())
     if not results:
         await cb.message.answer("❌ چیزی برای شماتیک پیدا نشد.")
     else:
         EXT_RESULTS[cb.from_user.id] = {"items": results, "source": "github", "domain": domain, "facet": "schematic"}
-        kb = results_kb(results, prefix="ext", domain=domain, facet="schematic")
-        await cb.message.answer("📌 <b>نتایج شماتیک:</b>", reply_markup=kb.as_markup())
+        kb = results_kb(results, prefix="ext", domain=domain, facet="schematic", page=0)
+        await cb.message.answer("📌 <b>نتایج شماتیک:</b>", reply_markup=kb)
     await cb.answer()
 
 @dp.callback_query(F.data == "search_free")
@@ -525,6 +634,13 @@ async def handle_query(msg: Message):
     # ensure user state exists
     USER_STATE.setdefault(msg.from_user.id, {"mode": None, "domain": None, "facet": None, "last_domain": None})
     st = USER_STATE.get(msg.from_user.id) or {"mode": None, "domain": None, "facet": None}
+
+    # show typing indicator for longer operations
+    try:
+        await bot.send_chat_action(msg.chat.id, action=ChatActions.TYPING)
+    except Exception:
+        pass
+
     if st["mode"] == "py":
         sent = await msg.answer("⏳ آماده‌سازی جستجوی پایتون...")
         async def _search():
@@ -532,19 +648,20 @@ async def handle_query(msg: Message):
             if local:
                 return {"source": "local", "items": local}
             query = f'{q} language:python in:file'
-            items = await github_code_search_multi([query], per_page=5, cap=8)
+            items = await github_code_search_multi([query], per_page=5, cap=24)
             if not items:
                 query2 = f'{q} language:python filename:README in:file'
-                items = await github_code_search_multi([query2], per_page=5, cap=8)
+                items = await github_code_search_multi([query2], per_page=5, cap=24)
             return {"source": "github", "items": items}
         res = await with_spinner(sent, "در حال جستجوی پایتون (محلی → GitHub)", _search())
         if not res or not res.get("items"):
             await msg.answer("❌ چیزی پیدا نشد. یک کلیدواژه‌ی ساده‌تر امتحان کن.")
             return
-        EXT_RESULTS[msg.from_user.id] = {"items": res["items"], "source": res["source"]}
-        kb = results_kb(res["items"], prefix="ext", domain="python", facet="code")
-        await msg.answer("📌 <b>نتایج پایتون:</b>", reply_markup=kb.as_markup())
+        EXT_RESULTS[msg.from_user.id] = {"items": res["items"], "source": res["source"], "domain": "python", "facet": "code"}
+        kb = results_kb(res["items"], prefix="ext", domain="python", facet="code", page=0)
+        await msg.answer("📌 <b>نتایج پایتون:</b>", reply_markup=kb)
         return
+
     if st["mode"] == "search" and st["domain"] and st["facet"]:
         domain = st["domain"]; facet = st["facet"]
         sent = await msg.answer("⏳ اول از دیتابیس محلی می‌گردم...")
@@ -553,39 +670,42 @@ async def handle_query(msg: Message):
             if local:
                 return {"source":"local","items":local}
             queries = build_github_queries(domain, facet, q)
-            items = await github_code_search_multi(queries, per_page=5, cap=8)
+            items = await github_code_search_multi(queries, per_page=5, cap=24)
             if not items and facet != "code":
-                items = await github_code_search_multi([q + " in:file"], per_page=5, cap=8)
+                items = await github_code_search_multi([q + " in:file"], per_page=5, cap=24)
             return {"source":"github","items":items}
         res = await with_spinner(sent, "در حال جستجو (محلی → GitHub)", _search())
         if not res or not res.get("items"):
             await msg.answer("❌ چیزی پیدا نشد. کلیدواژه‌ی دقیق‌تر بده.")
             return
         EXT_RESULTS[msg.from_user.id] = {"items": res["items"], "source": res["source"], "domain": domain, "facet": facet}
-        kb = results_kb(res["items"], prefix="ext", domain=domain, facet=facet)
-        await msg.answer(f"📌 <b>نتایج ({domain} / {FACETS[facet]['label']}):</b>", reply_markup=kb.as_markup())
+        kb = results_kb(res["items"], prefix="ext", domain=domain, facet=facet, page=0)
+        await msg.answer(f"📌 <b>نتایج ({domain} / {FACETS[facet]['label']}):</b>", reply_markup=kb)
         return
+
     if st.get("mode") == "search_free":
         sent = await msg.answer("⏳ در حال جستجوی آزاد روی GitHub...")
         async def _search():
-            return await github_code_search_multi([q], per_page=5, cap=8)
+            return await github_code_search_multi([q], per_page=5, cap=24)
         results = await with_spinner(sent, "در حال جستجوی آزاد روی GitHub", _search())
         if not results:
             await msg.answer("❌ چیزی پیدا نشد.")
             return
         EXT_RESULTS[msg.from_user.id] = {"items": results, "source": "github"}
-        kb = results_kb(results, prefix="ext")
-        await msg.answer("📌 <b>نتایج جستجو:</b>", reply_markup=kb.as_markup())
+        kb = results_kb(results, prefix="ext", page=0)
+        await msg.answer("📌 <b>نتایج جستجو:</b>", reply_markup=kb)
         return
+
+    # default free search
     await msg.answer("⏳ در حال جستجوی آزاد روی GitHub...")
     try:
-        results = await github_code_search_multi([q], per_page=5, cap=8)
+        results = await github_code_search_multi([q], per_page=5, cap=24)
         if not results:
             await msg.answer("❌ چیزی پیدا نشد.")
             return
         EXT_RESULTS[msg.from_user.id] = {"items": results, "source": "github"}
-        kb = results_kb(results, prefix="ext")
-        await msg.answer("📌 <b>نتایج جستجو:</b>", reply_markup=kb.as_markup())
+        kb = results_kb(results, prefix="ext", page=0)
+        await msg.answer("📌 <b>نتایج جستجو:</b>", reply_markup=kb)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 403:
             reset = e.response.headers.get("X-RateLimit-Reset")
@@ -603,49 +723,84 @@ async def local_open(cb: CallbackQuery):
     if not st or not st.get("items"):
         await cb.answer("🔎 نتیجه‌ای مرتبط وجود ندارد — دوباره جستجو کن.", show_alert=True)
         return
-    items = (st.get("items") or [])
+
+    items = st.get("items") or []
     try:
         idx = int(cb.data.split("_", 2)[2])
     except Exception:
-        await cb.answer("نامعتبر", show_alert=True); return
+        await cb.answer("نامعتبر", show_alert=True)
+        return
+
     if idx < 0 or idx >= len(items):
-        await cb.answer("⏰ منقضی شده", show_alert=True); return
+        await cb.answer("⏰ منقضی شده", show_alert=True)
+        return
+
     item = items[idx]
-    state = USER_STATE.get(cb.from_user.id) or {}
+    source = st.get("source", "local")
+
+    # اگر نتیجه از GitHub آمده و raw_url موجود است، آن را دانلود کن و نمایش بده
+    if source == "github" and item.get("raw_url"):
+        try:
+            code = await fetch_text(item["raw_url"], headers=_gh_headers())
+        except Exception:
+            # نشد مستقیم بخونیم -> ارجاع به GitHub
+            await cb.message.answer(
+                f"❌ دانلود مستقیم نشد.\n"
+                f"🔗 <a href='{item.get('html_url','')}'>مشاهده در GitHub</a>\n"
+                f"📁 <code>{item.get('repo','')}/{item.get('path','')}</code>",
+                disable_web_page_preview=False
+            )
+            await cb.answer()
+            return
+
+        caption = (
+            f"🔗 <a href='{item.get('html_url','')}'>مشاهده در GitHub</a>\n"
+            f"📁 <code>{item.get('repo','')}/{item.get('path','')}</code>\n"
+            f"⚠️ لایسنس رو چک کن."
+        )
+        safe = _html.escape(code)
+        if len(caption) + len(safe) < MAX_TEXT_LEN:
+            await safe_edit(cb.message, f"<pre><code>{safe}</code></pre>\n\n{caption}")
+        else:
+            filename = item.get("name") or (item.get("path") or "snippet.txt").split("/")[-1]
+            doc = BufferedInputFile(code.encode("utf-8"), filename=filename)
+            await cb.message.answer_document(doc, caption=caption)
+        await cb.answer()
+        return
+
+    # در غیر این صورت فرض می‌کنیم آیتم محلی از DB است و باید فیلدهای facet را چک کنیم
+    state = USER_STATE.get(user_id) or {}
     facet = state.get("facet", "code")
     fields = FACETS.get(facet, FACETS["code"])["fields"]
+
     content = None
+    # آیتم‌های محلی معمولاً فیلدها را دارند؛ اولین فیلد غیرخالی را بگیر
     for f in fields:
         if item.get(f):
             content = str(item.get(f))
             break
+
     if not content:
         await cb.message.answer("❌ برای این مورد، محتوای مرتبط در DB وجود ندارد.")
-        await cb.answer(); return
+        await cb.answer()
+        return
+
+    # اگر مقدار یک URL است سعی کن آن را دریافت کنی
     if re.match(r"^https?://", content):
         try:
             body = await fetch_text(content)
             content = body
         except Exception:
             await cb.message.answer(f"🔗 <a href='{content}'>مشاهده محتوا</a>", disable_web_page_preview=False)
-            await cb.answer(); return
+            await cb.answer()
+            return
+
     safe = _html.escape(content)
     if len(safe) < MAX_TEXT_LEN:
         await safe_edit(cb.message, f"<pre><code>{safe}</code></pre>")
     else:
         doc = BufferedInputFile(content.encode("utf-8"), filename=f"{facet}.txt")
         await cb.message.answer_document(doc, caption=f"📄 {FACETS[facet]['label']}")
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("fallback_"))
-async def do_fallback(cb: CallbackQuery):
-    _, domain, facet = cb.data.split("_", 2)
-    await cb.message.answer(
-        f"🔁 برای ادامه جستجو در GitHub ({FACETS[facet]['label']}), یک عبارت بفرست.\n"
-        "مثلاً: <code>line follower</code> یا <code>ESP32 MQTT</code>"
-    )
-    st = USER_STATE.get(cb.from_user.id) or {}
-    USER_STATE[cb.from_user.id] = {**st, "mode": "search", "domain": domain, "facet": facet}
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("ext_open_"))
@@ -665,21 +820,52 @@ async def ext_open(cb: CallbackQuery):
     except Exception:
         await cb.message.answer(
             f"❌ دانلود مستقیم نشد.\n"
-            f"🔗 <a href='{item['html_url']}'>مشاهده در GitHub</a>\n"
-            f"📁 <code>{item['repo']}/{item['path']}</code>"
+            f"🔗 <a href='{item.get('html_url','')}'>مشاهده در GitHub</a>\n"
+            f"📁 <code>{item.get('repo','')}/{item.get('path','')}</code>"
         )
         await cb.answer(); return
     caption = (
-        f"🔗 <a href='{item['html_url']}'>مشاهده در GitHub</a>\n"
-        f"📁 <code>{item['repo']}/{item['path']}</code>\n"
+        f"🔗 <a href='{item.get('html_url','')}'>مشاهده در GitHub</a>\n"
+        f"📁 <code>{item.get('repo','')}/{item.get('path','')}</code>\n"
         f"⚠️ لایسنس رو چک کن."
     )
     safe = _html.escape(code)
     if len(caption) + len(safe) < MAX_TEXT_LEN:
         await safe_edit(cb.message, f"<pre><code>{safe}</code></pre>\n\n{caption}")
     else:
-        doc = BufferedInputFile(code.encode("utf-8"), filename=item["name"] or "snippet.txt")
+        doc = BufferedInputFile(code.encode("utf-8"), filename=item.get("name") or "snippet.txt")
         await cb.message.answer_document(doc, caption=caption)
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("ext_page_"))
+async def ext_page_cb(cb: CallbackQuery):
+    """
+    Handle pagination for ext results. Callback data: ext_page_{page}
+    """
+    user_id = cb.from_user.id
+    parts = cb.data.split("_")
+    if len(parts) < 3:
+        await cb.answer("نامعتبر", show_alert=True); return
+    try:
+        page = int(parts[2])
+    except Exception:
+        await cb.answer("نامعتبر", show_alert=True); return
+
+    st = EXT_RESULTS.get(user_id)
+    if not st or not st.get("items"):
+        await cb.answer("نتیجه‌ای موجود نیست.", show_alert=True); return
+    items = st["items"]
+    domain = st.get("domain")
+    facet = st.get("facet")
+    kb = results_kb(items, prefix="ext", domain=domain, facet=facet, page=page)
+    # edit message to show new page keyboard
+    try:
+        await cb.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        try:
+            await cb.message.answer("صفحه جدید:", reply_markup=kb)
+        except Exception:
+            pass
     await cb.answer()
 
 # back to main handler
@@ -736,3 +922,4 @@ def main():
 
 if __name__ == "__main__":
     web.run_app(main(), host="0.0.0.0", port=PORT)
+
